@@ -141,7 +141,10 @@ def resolve_cities(
             if street:
                 geo_streets.append(street)
             else:
-                # Street unresolved via index — store GeoNames point if available
+                # Street unresolved via index — keep span+city_id so display layer
+                # can resolve to edge_ids at render time via edges table query.
+                # Also store GeoNames point if available as a coordinate fallback.
+                geo_streets.append(StreetResolution(span=span.text, edge_ids=[], city_id=scope_city_id))
                 coords = _best_geonames_coords(span.text)
                 if coords:
                     lat, lon, geonames_id = coords
