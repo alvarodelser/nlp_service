@@ -96,7 +96,7 @@ flowchart TB
     gc --> gd["Pass B1 — City Resolution\nGeoNames populated-place lookup\nScore: population + headline + source prior\nResult: city_id or null per span"]
     gd --> ge["Pass B2 — Street Resolution\nNormalize span, lookup in\ncity-scoped street index\nFallback: GeoNames in city bbox"]
     ge --> gf["Pass B3 — Point Fallback\nRemaining spans: GeoNames lat/lon\nReverse-geocode to nearest city"]
-    gf --> gh["Output: geo_cities[]\ngeo_streets[]\n(no scope — determined by classifier)"]
+    gf --> gh["Output: geo_cities[]\ngeo_streets[] · geo_points[]\n(no scope — determined by classifier)"]
   end
 
   subgraph CLASSIFIER["CLASSIFIER   ·   /classify  (two NLI passes)"]
@@ -152,11 +152,11 @@ Context-based disambiguation resolves ambiguous spans (where multiple GeoNames c
 2. **Dominant document city** — after all high-confidence spans are resolved, the city appearing most frequently (weighted by confidence) is used as a filter for ambiguous spans.
 3. **Sentence co-occurrence** — if the ambiguous span appears in the same sentence as an already-resolved span, prefer the candidate whose city matches.
 4. **Source prior** — the learned source-to-city mapping breaks remaining ties.
-5. **Discard** — if no strategy resolves the ambiguity, the span is dropped.
+5. **Coordinate fallback** — if city resolution still fails but the span has a GeoNames match with lat/lon, it is stored as a `geo_point` for map rendering purposes. Only spans with no GeoNames match at all are discarded.
 
-Pass B2 resolves street spans scoped to the dominant city, normalising the span (lowercase, strip accents, strip prefix) and looking it up in a per-city street index.
+Pass B2 resolves street spans scoped to the dominant city, normalising the span (lowercase, strip accents, strip prefix) and looking it up in a per-city street index. Streets unresolved via the index also fall back to GeoNames coordinates and are stored as `geo_points`.
 
-The endpoint returns only `geo_cities[]` and `geo_streets[]`. Geographic scope is determined downstream by the classifier from the assembled city evidence.
+The endpoint returns `geo_cities[]`, `geo_streets[]`, and `geo_points[]`. Geographic scope is determined downstream by the classifier from the assembled city evidence.
 
 ### 3.5 Topic and Scope Classification (`/classify`)
 
@@ -207,7 +207,7 @@ flowchart TD
   MEM5["in memory:\nheadline · summary · embedding_summary"]:::mem
 
   S6["STEP 6 — Geographic Entity Resolution\nPOST /geotag (raw_text + headline)\nNER → city resolution → street lookup\nReturns entities only — no scope"]:::step
-  MEM6["in memory:\ngeo_cities[] · geo_streets[]"]:::mem
+  MEM6["in memory:\ngeo_cities[] · geo_streets[] · geo_points[]"]:::mem
 
   S7["STEP 7 — Topic + Scope Classification\nPOST /classify\nTopic NLI: search_tags + summary → topics[]\nScope NLI (3-way): summary + geo_cities\n+ source_profile → geo_scope"]:::step
   MEM7["in memory:\ntopics[] · scores{} · geo_scope"]:::mem
@@ -371,7 +371,7 @@ All endpoints accept and return `application/json`. The base URL is `http://nlp-
 | `POST` | `/dedup-check` | `{article_id, text}` | `{duplicate_of: id\|null}` |
 | `POST` | `/dedup-check-embed` | `{article_id, embedding_raw: float[384]}` | `{duplicate_of: id\|null}` |
 | `POST` | `/summarize` | `{article_id, text, extract, headline}` | `{headline, summary, embedding_summary: float[384]}` |
-| `POST` | `/geotag` | `{article_id, text, headline}` | `{geo_cities[], geo_streets[]}` |
+| `POST` | `/geotag` | `{article_id, text, headline}` | `{geo_cities[], geo_streets[], geo_points[]}` |
 | `POST` | `/classify` | `{article_id, summary, geo_cities[], search_tags[], source_profile?}` | `{topics[], scores{}, geo_scope}` |
 | `POST` | `/ollama/generate` | Ollama generate request | Ollama generate response |
 | `GET` | `/ollama/tags` | — | `{models: [{name, size, ...}]}` |

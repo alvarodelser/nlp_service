@@ -56,9 +56,17 @@ class ResolvedStreet(BaseModel):
     city_id: int
 
 
+class GeoPoint(BaseModel):
+    span: str
+    lat: float
+    lon: float
+    geonames_id: int | None = None
+
+
 class GeotagResponse(BaseModel):
     geo_cities: list[ResolvedCity]
     geo_streets: list[ResolvedStreet]
+    geo_points: list[GeoPoint]
 
 
 class SourceProfile(BaseModel):

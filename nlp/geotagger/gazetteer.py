@@ -64,55 +64,75 @@ class StreetResolution:
     city_id: int
 
 
+@dataclass
+class PointResolution:
+    span: str
+    lat: float
+    lon: float
+    geonames_id: int | None
+
+
 def resolve_cities(
     spans,              # list[Span] from ner.py
     source: str | None,
-) -> tuple[list[CityResolution], list[StreetResolution]]:
+) -> tuple[list[CityResolution], list[StreetResolution], list[PointResolution]]:
     """
     Two-pass resolution:
       Pass B1: resolve each non-street span to a city.
       Pass B2: resolve street spans within winning city.
-    Ambiguous spans are resolved via document context or discarded.
+    Ambiguous spans go through the context cascade; if still unresolved,
+    they are stored as geo_points (lat/lon from GeoNames) for map plotting.
     """
     source_city_id = _source_prior_city_id(source)
 
     # B1 — city resolution for non-street spans
     resolved: dict[str, CityResolution | None] = {}
+    geonames_coords: dict[str, tuple[float, float, int | None]] = {}  # span → (lat, lon, id)
     for span in spans:
         if span.hint == "street":
             continue
         candidates = _lookup_city_candidates(span.text)
         resolution = _pick_candidate(candidates, source_city_id)
         resolved[span.text] = resolution
+        # Cache the best GeoNames coordinate for fallback
+        coords = _best_geonames_coords(span.text)
+        if coords:
+            geonames_coords[span.text] = coords
 
     # Determine dominant city from high-confidence resolutions
     high_conf = [r for r in resolved.values() if r and r.confidence >= AMBIGUITY_THRESHOLD]
     dominant_id = _dominant_city(high_conf)
 
-    # Second pass: re-resolve ambiguous spans using dominant city
+    # Second pass: re-resolve ambiguous spans using dominant city + co-occurrence
     for span in spans:
         if span.hint == "street" or resolved.get(span.text) is not None:
             continue
         candidates = _lookup_city_candidates(span.text)
         if not candidates:
             continue
-        # Filter to dominant city if available
         if dominant_id:
             dc_candidates = [c for c in candidates if c.city_id == dominant_id]
             if dc_candidates:
                 resolved[span.text] = dc_candidates[0]
                 continue
-        # Sentence co-occurrence: prefer candidate matching a resolved span in same sentence
         co_resolved = _cooccurrence_disambiguate(span, spans, resolved, candidates)
-        resolved[span.text] = co_resolved  # may still be None → discard
+        resolved[span.text] = co_resolved  # None → falls back to geo_point
 
-    geo_cities = [r for r in resolved.values() if r is not None]
-    # Deduplicate city list
-    geo_cities = _deduplicate_cities(geo_cities)
+    geo_cities = _deduplicate_cities([r for r in resolved.values() if r is not None])
+
+    # Spans that could not be resolved to a city → store as geo_points for map use
+    geo_points: list[PointResolution] = []
+    for span in spans:
+        if span.hint == "street" or resolved.get(span.text) is not None:
+            continue
+        coords = geonames_coords.get(span.text)
+        if coords:
+            lat, lon, geonames_id = coords
+            geo_points.append(PointResolution(span.text, lat, lon, geonames_id))
 
     # B2 — street resolution scoped to dominant city (or first resolved city)
     scope_city_id = dominant_id or (geo_cities[0].city_id if geo_cities else None)
-    geo_streets = []
+    geo_streets: list[StreetResolution] = []
     if scope_city_id is not None:
         for span in spans:
             if span.hint != "street":
@@ -120,8 +140,14 @@ def resolve_cities(
             street = _resolve_street(span.text, scope_city_id)
             if street:
                 geo_streets.append(street)
+            else:
+                # Street unresolved via index — store GeoNames point if available
+                coords = _best_geonames_coords(span.text)
+                if coords:
+                    lat, lon, geonames_id = coords
+                    geo_points.append(PointResolution(span.text, lat, lon, geonames_id))
 
-    return geo_cities, geo_streets
+    return geo_cities, geo_streets, geo_points
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +273,14 @@ def _normalise_street(span: str) -> str:
     return _normalise(stripped)
 
 
+def _best_geonames_coords(name: str) -> tuple[float, float, int | None] | None:
+    norm = _normalise(name)
+    for entry in _geonames:
+        if _normalise(entry["name"]) == norm and entry.get("lat") and entry.get("lon"):
+            return entry["lat"], entry["lon"], entry.get("geonames_id")
+    return None
+
+
 def _load_geonames(path: str) -> list[dict]:
     rows = []
     with open(path, encoding="utf-8") as f:
@@ -255,6 +289,7 @@ def _load_geonames(path: str) -> list[dict]:
             if len(parts) < 8:
                 continue
             rows.append({
+                "geonames_id": int(parts[0]) if parts[0].isdigit() else None,
                 "name": parts[1],
                 "feature_class": parts[6],
                 "lat": float(parts[4]) if parts[4] else None,
