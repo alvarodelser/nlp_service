@@ -11,6 +11,7 @@ Pipeline order:
   4  local                   OOD relevance gate (cosine to centroid)
   5  POST /summarize         LLM headline + summary + summary embedding
   6  POST /geotag            NER + city/street resolution (no scope)
+  6b local                   Edge lookup — resolve street spans to edge_ids via DB
   7  POST /classify          Topic NLI + scope NLI (joint fusion)
   DB  atomic INSERT          All 13 derived fields in one transaction
 """
@@ -19,7 +20,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
+import unicodedata
 from pathlib import Path
 
 import asyncpg
@@ -51,7 +54,7 @@ _counts = {
 }
 _step_times: dict[str, list[float]] = {k: [] for k in [
     "dedup_check", "extract", "dedup_embed", "relevance",
-    "summarize", "geotag", "classify", "db_write",
+    "summarize", "geotag", "edge_lookup", "classify", "db_write",
 ]}
 
 
@@ -67,6 +70,64 @@ def _load_config() -> None:
 
 def _source_profile(source: str) -> dict | None:
     return _source_profiles.get(source)
+
+
+# ── street normalisation (mirrors nlp/geotagger/gazetteer.py) ─────────────────
+
+_STREET_PREFIX_RE = re.compile(
+    r"^(Calle|Avda?\.?|Avenida|Plaza|Paseo|Ronda|Travesía|Carretera|C/)\s+",
+    flags=re.IGNORECASE,
+)
+
+
+def _normalise_street_span(span: str) -> str:
+    stripped = _STREET_PREFIX_RE.sub("", span.strip())
+    nfkd = unicodedata.normalize("NFKD", stripped.lower().strip())
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+async def _resolve_street_edges(
+    db: asyncpg.Connection,
+    geo_streets: list[dict],
+) -> list[dict]:
+    """
+    For each street entry returned by /geotag, query the edges table to fill
+    in edge_ids for that city.  Entries already carrying edge_ids (from a
+    pre-built street_index snapshot) are left untouched.
+    """
+    if not geo_streets:
+        return geo_streets
+
+    result = []
+    for street in geo_streets:
+        if street.get("edge_ids"):          # already resolved by NLP snapshot
+            result.append(street)
+            continue
+
+        city_id = street.get("city_id")
+        span    = street.get("span", "")
+        if not city_id or not span:
+            result.append(street)
+            continue
+
+        norm = _normalise_street_span(span)
+        try:
+            rows = await db.fetch(
+                """
+                SELECT id FROM edges
+                WHERE city_id = $1
+                  AND lower(unaccent(name)) = $2
+                """,
+                city_id, norm,
+            )
+            edge_ids = [row["id"] for row in rows]
+        except Exception as exc:
+            log.warning("Edge lookup failed '%s' city_id=%s: %s", span, city_id, exc)
+            edge_ids = []
+
+        result.append({**street, "edge_ids": edge_ids})
+
+    return result
 
 
 # ── pipeline ──────────────────────────────────────────────────────────────────
@@ -148,6 +209,11 @@ async def ingest_article(article: dict, db: asyncpg.Connection, client: httpx.As
     r.raise_for_status()
     _step_times["geotag"].append(time.perf_counter() - t0)
     geo = r.json()
+
+    # ── Step 6b: Resolve street spans to edge_ids ────────────────────────────
+    t0 = time.perf_counter()
+    geo["geo_streets"] = await _resolve_street_edges(db, geo["geo_streets"])
+    _step_times["edge_lookup"].append(time.perf_counter() - t0)
 
     # ── Step 7: Topic + scope classification ──────────────────────────────────
     t0 = time.perf_counter()
