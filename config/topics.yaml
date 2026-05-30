@@ -1,0 +1,30 @@
+relevance_threshold: 0.75
+nli_threshold: 0.30
+scope_threshold: 0.35
+
+labels:
+  - infraestructura ciclista
+  - carril bici
+  - aparcamiento de bicicletas
+  - zonas de bajas emisiones
+  - patinete eléctrico y VMP
+  - movilidad compartida
+  - transporte público
+  - peatonalización
+  - seguridad vial
+  - política de movilidad
+  - accidentalidad y siniestralidad
+  - logística urbana sostenible
+  - infraestructura peatonal
+  - bicicleta eléctrica
+  - intermodalidad
+
+scope_hypotheses:
+  national: >
+    Este artículo trata sobre una política, regulación o iniciativa de movilidad
+    a nivel nacional en España, sin estar limitado a una ciudad o región específica.
+  regional: >
+    Este artículo trata sobre movilidad en una comunidad autónoma, provincia
+    o región específica de España.
+  city: >
+    Este artículo trata sobre movilidad en una ciudad o municipio concreto de España.
