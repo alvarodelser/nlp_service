@@ -1,63 +1,77 @@
+# nlp_service/nlp/geotagger/ner.py
 import re
-from dataclasses import dataclass
-from transformers import pipeline
+from dataclasses import dataclass, field
 
-NER_MODEL = "PlanTL-GOB-ES/roberta-base-bne-ner-capiter"
-STREET_PREFIX = re.compile(
-    r"^(Calle|Avda?\.?|Avenida|Plaza|Paseo|Ronda|Travesía|Carretera|C/)\s+",
+from transformers import pipeline as hf_pipeline
+
+_MODEL = "PlanTL-GOB-ES/roberta-base-bne-ner-capiter"
+_ner_pipeline = None
+_KEEP_LABELS = {"LOC"}
+
+_STREET_RE = re.compile(
+    r'(?:^|(?<=\s))'
+    r'(?:Calle|Avda?\.?|Avenida|Plaza|Pza\.?|Paseo|Ps\.?|'
+    r'Glorieta|Ronda|C/|Camino|Carretera|Ctra\.?)\s+'
+    r'([A-ZÁÉÍÓÚÜÑ][^\n,;.]{2,50})',
     re.IGNORECASE,
 )
-
-_ner_pipeline = None
 
 
 @dataclass
 class Span:
     text: str
-    label: str       # LOC | GPE | FAC
-    hint: str | None  # "street" if street prefix detected
-    char_start: int
-    sentence: str    # sentence the span appears in (for co-occurrence)
+    label: str
+    start_char: int
+    end_char: int
+    hint: str = ""   # "street" when matched by prefix regex
 
 
-def startup() -> None:
+def _ensure_loaded() -> None:
     global _ner_pipeline
-    _ner_pipeline = pipeline(
-        "token-classification",
-        model=NER_MODEL,
-        aggregation_strategy="simple",
-    )
+    if _ner_pipeline is None:
+        _ner_pipeline = hf_pipeline(
+            "token-classification",
+            model=_MODEL,
+            aggregation_strategy="simple",
+            device=-1,   # CPU; set to 0 for GPU
+        )
 
 
-def extract_spans(text: str, headline: str) -> list[Span]:
-    full = headline + ". " + text
-    raw = _ner_pipeline(full)
-    spans: list[Span] = []
-    sentences = _split_sentences(full)
+def extract_spans(text: str) -> list[Span]:
+    _ensure_loaded()
+    assert _ner_pipeline is not None
 
-    for entity in raw:
-        label = entity["entity_group"]
-        if label not in ("LOC", "GPE", "FAC"):
+    # Stage A1: transformer NER
+    raw = _ner_pipeline(text)
+    ner_spans: list[Span] = [
+        Span(
+            text=e["word"],
+            label=e["entity_group"],
+            start_char=e["start"],
+            end_char=e["end"],
+        )
+        for e in raw
+        if e["entity_group"] in _KEEP_LABELS
+    ]
+
+    # Track covered char ranges to avoid double-counting
+    covered: set[tuple[int, int]] = {(s.start_char, s.end_char) for s in ner_spans}
+
+    # Stage A2: street-prefix regex (post-NER layer)
+    street_spans: list[Span] = []
+    for m in _STREET_RE.finditer(text):
+        start, end = m.start(), m.end()
+        # skip if already covered by NER
+        if any(s <= start < e or s < end <= e for s, e in covered):
             continue
-        span_text = entity["word"].strip()
-        char_start = entity["start"]
-        hint = "street" if STREET_PREFIX.match(span_text) else None
-        sentence = _find_sentence(sentences, char_start)
-        spans.append(Span(span_text, label, hint, char_start, sentence))
+        full_match = m.group(0).strip()
+        street_spans.append(Span(
+            text=full_match,
+            label="LOC",
+            start_char=start,
+            end_char=end,
+            hint="street",
+        ))
+        covered.add((start, end))
 
-    return spans
-
-
-def _split_sentences(text: str) -> list[tuple[int, str]]:
-    import re
-    result = []
-    for m in re.finditer(r"[^.!?]+[.!?]?", text):
-        result.append((m.start(), m.group()))
-    return result
-
-
-def _find_sentence(sentences: list[tuple[int, str]], char_start: int) -> str:
-    for start, sent in reversed(sentences):
-        if start <= char_start:
-            return sent
-    return ""
+    return ner_spans + street_spans

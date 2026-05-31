@@ -8,4 +8,4 @@ router = APIRouter()
 @router.post("/extract", response_model=ExtractResponse)
 def extract(req: ExtractRequest) -> ExtractResponse:
     extract_text, embedding = extract_and_embed(req.text)
-    return ExtractResponse(extract=extract_text, embedding_raw=embedding.tolist())
+    return ExtractResponse(article_id=req.article_id, extract=extract_text, embedding_raw=embedding.tolist())

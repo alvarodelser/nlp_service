@@ -1,88 +1,97 @@
-"""
-Two separate NLI passes:
-  1. Topic pass  — multi-label, premise = search_tags + summary
-  2. Scope pass  — 3-way exclusive, premise = summary + city evidence + source profile
-"""
+# nlp_service/nlp/classifier/service.py
+from __future__ import annotations
 
-from transformers import pipeline
-from nlp.classifier import taxonomy
-from api.models import ClassifyResponse, ResolvedCity, SourceProfile
-
-NLI_MODEL = "Recognai/bert-base-spanish-wwm-cased-xnli"
-
-_nli = None
+from . import model, taxonomy
 
 
-def startup() -> None:
-    global _nli
-    taxonomy.startup()
-    _nli = pipeline("zero-shot-classification", model=NLI_MODEL)
+def load() -> None:
+    taxonomy.load()
 
 
-def classify(
+def run(
     summary: str,
-    geo_cities: list[ResolvedCity],
-    search_tags: list[str],
-    source_profile: SourceProfile | None,
-) -> ClassifyResponse:
-    topics, scores = _topic_pass(summary, search_tags)
-    geo_scope = _scope_pass(summary, geo_cities, source_profile)
-    return ClassifyResponse(topics=topics, scores=scores, geo_scope=geo_scope)
+    geo_cities: list[dict] | None = None,
+    search_tags: list[str] | None = None,
+    source_profile: dict | None = None,
+) -> dict:
+    tax = taxonomy.load()
+    geo_cities = geo_cities or []
+    search_tags = search_tags or []
 
+    # Relevance gate: NLI hypothesis check on the summary
+    if tax.relevance_hypothesis:
+        rel = model.classify(summary, labels=[tax.relevance_hypothesis], multi_label=True)
+        rel_score = rel["scores"][0] if rel["scores"] else 0.0
+        if rel_score < tax.relevance_threshold:
+            return {"topics": [], "scores": {}, "geo_scope": "national", "out_of_scope": True}
 
-def _topic_pass(summary: str, search_tags: list[str]) -> tuple[list[str], dict[str, float]]:
+    # Topic NLI: premise is search_tags + summary (search tags act as editorial prior)
     tag_prefix = ""
     if search_tags:
         tag_prefix = "Artículo buscado por: " + ", ".join(f"'{t}'" for t in search_tags) + ". "
-    premise = tag_prefix + summary
+    topic_premise = tag_prefix + summary
 
-    result = _nli(
-        premise,
-        candidate_labels=taxonomy.labels(),
-        multi_label=True,
-        hypothesis_template="Este artículo trata sobre {}.",
-    )
+    all_labels = tax.labels + tax.blacklist_labels
+    raw = model.classify(topic_premise, labels=all_labels, multi_label=True)
+    scored = dict(zip(raw["labels"], raw["scores"]))
 
-    threshold = taxonomy.nli_threshold()
-    scores = dict(zip(result["labels"], result["scores"]))
-    topics = [label for label, score in scores.items() if score >= threshold]
-    return topics, scores
+    if tax.blacklist_labels:
+        top_blacklist_score = max(scored.get(lbl, 0.0) for lbl in tax.blacklist_labels)
+        if top_blacklist_score >= tax.blacklist_threshold:
+            return {"topics": [], "scores": scored, "geo_scope": "national", "out_of_scope": True}
+
+    filtered = sorted(
+        [(lbl, scored[lbl]) for lbl in tax.labels if scored.get(lbl, 0) >= tax.score_threshold],
+        key=lambda x: x[1], reverse=True,
+    )[:tax.top_k]
+
+    # Scope NLI: separate 3-way exclusive pass with assembled geographic evidence
+    geo_scope = _scope_pass(summary, geo_cities, source_profile, tax)
+
+    return {
+        "topics": [lbl for lbl, _ in filtered],
+        "scores": {lbl: scored[lbl] for lbl in tax.labels},
+        "geo_scope": geo_scope,
+        "out_of_scope": False,
+    }
 
 
 def _scope_pass(
     summary: str,
-    geo_cities: list[ResolvedCity],
-    source_profile: SourceProfile | None,
+    geo_cities: list[dict],
+    source_profile: dict | None,
+    tax: taxonomy.Taxonomy,
 ) -> str:
+    if not tax.scope_hypotheses:
+        return _scope_fallback(geo_cities)
+
     city_context = ""
     if geo_cities:
-        names = ", ".join(c.city_name for c in geo_cities[:5])
+        names = ", ".join(c["city_name"] for c in geo_cities[:5])
         city_context = f" Se mencionan las ciudades: {names}."
+
     source_context = ""
     if source_profile:
-        if source_profile.city:
-            source_context += f" La fuente cubre habitualmente: {source_profile.city}."
-        elif source_profile.region:
-            source_context += f" La fuente cubre habitualmente: {source_profile.region}."
+        if source_profile.get("city"):
+            source_context += f" La fuente cubre habitualmente: {source_profile['city']}."
+        elif source_profile.get("region"):
+            source_context += f" La fuente cubre habitualmente: {source_profile['region']}."
 
     premise = summary + city_context + source_context
 
-    hypotheses = taxonomy.scope_hypotheses()
-    candidate_labels = list(hypotheses.keys())    # national, regional, city
-    hypothesis_texts = list(hypotheses.values())
-
-    # Run NLI once per hypothesis and pick the highest-scoring one above threshold
     scope_scores: dict[str, float] = {}
-    for label, hyp in zip(candidate_labels, hypothesis_texts):
-        result = _nli(premise, candidate_labels=[hyp], multi_label=False)
+    for label, hyp in tax.scope_hypotheses.items():
+        result = model.classify(premise, labels=[hyp], multi_label=False)
         scope_scores[label] = result["scores"][0]
 
-    threshold = taxonomy.scope_threshold()
-    best_scope = max(scope_scores, key=scope_scores.get)
-    if scope_scores[best_scope] >= threshold:
+    best_scope = max(scope_scores, key=lambda k: scope_scores[k])
+    if scope_scores[best_scope] >= tax.scope_threshold:
         return best_scope
 
-    # Fallback: infer from city evidence alone
+    return _scope_fallback(geo_cities)
+
+
+def _scope_fallback(geo_cities: list[dict]) -> str:
     if len(geo_cities) > 1:
         return "regional"
     if len(geo_cities) == 1:

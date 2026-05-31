@@ -1,52 +1,60 @@
+# nlp_service/nlp/dedup/persistence.py
+import json
+import logging
 import os
 import pickle
-import faiss
-import numpy as np
-from datasketch import MinHashLSH, MinHash
+from pathlib import Path
 
-MINHASH_PATH = os.getenv("MINHASH_INDEX_PATH", "data/minhash.pkl")
-FAISS_PATH = os.getenv("FAISS_INDEX_PATH", "data/faiss.index")
-EMBED_DIM = 384
-NUM_PERM = 128
+from . import embedding_index, id_map, minhash_index
 
+log = logging.getLogger(__name__)
 
-def load_minhash() -> MinHashLSH:
-    if os.path.exists(MINHASH_PATH):
-        with open(MINHASH_PATH, "rb") as f:
-            return pickle.load(f)
-    return MinHashLSH(threshold=0.75, num_perm=NUM_PERM)
+DATA_DIR = Path(os.environ.get("DEDUP_DATA_DIR", "/data/dedup"))
+SCHEMA_VERSION = 1
 
 
-def save_minhash(lsh: MinHashLSH) -> None:
-    os.makedirs(os.path.dirname(MINHASH_PATH) or ".", exist_ok=True)
-    with open(MINHASH_PATH, "wb") as f:
-        pickle.dump(lsh, f)
+def save_all(mh_idx: minhash_index.MinHashIndex,
+             emb_idx: embedding_index.EmbeddingIndex,
+             ids: id_map.IdMap) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with (DATA_DIR / "minhash_lsh.pkl").open("wb") as f:
+        pickle.dump({"lsh": mh_idx._lsh, "signatures": mh_idx._signatures,
+                     "threshold": mh_idx.threshold}, f)
+    (DATA_DIR / "faiss.index").write_bytes(emb_idx.serialize())
+    (DATA_DIR / "id_map.json").write_text(json.dumps(ids.to_dict()), encoding="utf-8")
+    (DATA_DIR / "state.json").write_text(json.dumps({
+        "n_articles": len(ids),
+        "schema_version": SCHEMA_VERSION,
+    }), encoding="utf-8")
+    log.info("dedup state flushed: %d articles", len(ids))
 
 
-def load_faiss() -> tuple[faiss.IndexFlatIP, list[str]]:
-    if os.path.exists(FAISS_PATH):
-        index = faiss.read_index(FAISS_PATH)
-        id_path = FAISS_PATH + ".ids"
-        with open(id_path, "rb") as f:
-            ids = pickle.load(f)
-        return index, ids
-    return faiss.IndexFlatIP(EMBED_DIM), []
+def load_all() -> tuple[minhash_index.MinHashIndex, embedding_index.EmbeddingIndex, id_map.IdMap]:
+    state_path = DATA_DIR / "state.json"
+    if not state_path.exists():
+        log.info("no existing dedup state; starting empty")
+        return (minhash_index.MinHashIndex(),
+                embedding_index.EmbeddingIndex(),
+                id_map.IdMap())
 
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if state.get("schema_version") != SCHEMA_VERSION:
+        log.warning("dedup schema_version mismatch (%s); starting empty",
+                    state.get("schema_version"))
+        return (minhash_index.MinHashIndex(),
+                embedding_index.EmbeddingIndex(),
+                id_map.IdMap())
 
-def save_faiss(index: faiss.IndexFlatIP, ids: list[str]) -> None:
-    os.makedirs(os.path.dirname(FAISS_PATH) or ".", exist_ok=True)
-    faiss.write_index(index, FAISS_PATH)
-    with open(FAISS_PATH + ".ids", "wb") as f:
-        pickle.dump(ids, f)
+    with (DATA_DIR / "minhash_lsh.pkl").open("rb") as f:
+        mh_payload = pickle.load(f)
+    mh = minhash_index.MinHashIndex(threshold=mh_payload["threshold"])
+    mh._lsh = mh_payload["lsh"]
+    mh._signatures = mh_payload["signatures"]
 
+    emb = embedding_index.EmbeddingIndex()
+    emb.deserialize((DATA_DIR / "faiss.index").read_bytes())
 
-def text_to_minhash(text: str) -> MinHash:
-    m = MinHash(num_perm=NUM_PERM)
-    for token in _shingle(text, n=3):
-        m.update(token.encode("utf-8"))
-    return m
+    ids = id_map.IdMap.from_dict(json.loads((DATA_DIR / "id_map.json").read_text(encoding="utf-8")))
 
-
-def _shingle(text: str, n: int) -> list[str]:
-    tokens = text.lower().split()
-    return [" ".join(tokens[i : i + n]) for i in range(max(1, len(tokens) - n + 1))]
+    log.info("dedup state loaded: %d articles", len(ids))
+    return mh, emb, ids

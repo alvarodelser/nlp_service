@@ -1,15 +1,41 @@
-from fastapi import APIRouter
+# nlp_service/api/routers/summarize.py
+import logging
+
+from fastapi import APIRouter, HTTPException
+import httpx
+
 from api.models import SummarizeRequest, SummarizeResponse
-from nlp.summarizer.service import summarize
+from api.warmth import mark_warm
+from nlp.summarizer import service as summarizer_service
+from nlp.encoder import encode
+
+log = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
 @router.post("/summarize", response_model=SummarizeResponse)
-async def summarize_article(req: SummarizeRequest) -> SummarizeResponse:
-    headline, summary, embedding = await summarize(req.text, req.extract, req.headline)
+def summarize(req: SummarizeRequest) -> SummarizeResponse:
+    if not req.text.strip():
+        raise HTTPException(status_code=422, detail="text must be non-empty")
+    try:
+        result = summarizer_service.run(
+            text=req.text,
+            extract=req.extract,
+            headline=req.headline,
+        )
+    except httpx.HTTPError as exc:
+        log.error("ollama unavailable: %s", exc, extra={"article_id": req.article_id})
+        raise HTTPException(status_code=503, detail="ollama_unavailable")
+    except (KeyError, ValueError) as exc:
+        log.error("ollama json format failed: %s", exc, extra={"article_id": req.article_id})
+        raise HTTPException(status_code=503, detail="ollama_json_format_failed")
+
+    embedding_summary = encode(result["headline"] + " " + result["summary"]).tolist()
+    mark_warm("summarize")
     return SummarizeResponse(
-        headline=headline,
-        summary=summary,
-        embedding_summary=embedding.tolist(),
+        article_id=req.article_id,
+        headline=result["headline"],
+        summary=result["summary"],
+        embedding_summary=embedding_summary,
     )

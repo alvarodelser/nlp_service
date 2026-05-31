@@ -1,0 +1,28 @@
+# nlp_service/docker-compose.yml
+# Standalone for local dev. Production deploys merge this into the root compose.
+services:
+  nlp-service:
+    build: .
+    container_name: nlp-service
+    ports:
+      - "${NLP_PORT:-4200}:8000"
+    environment:
+      OLLAMA_HOST: ${OLLAMA_HOST}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
+      DEDUP_LSH_THRESHOLD: "0.9"
+      DEDUP_EMBED_THRESHOLD: "0.85"
+      DEDUP_PERSIST_EVERY_N: "10"
+      DEDUP_DATA_DIR: /data/dedup
+      NLP_LOG_LEVEL: INFO
+    volumes:
+      - nlp_dedup_data:/data/dedup
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - b4c-net
+volumes:
+  nlp_dedup_data:
+
+networks:
+  b4c-net:
+    driver: bridge

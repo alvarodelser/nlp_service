@@ -1,24 +1,65 @@
-relevance_threshold: 0.75
-nli_threshold: 0.30
-scope_threshold: 0.35
+# nlp_service/config/topics.yaml
+# Urban alternative mobility taxonomy for BikesForCities.
+#
+# SCOPE: articles about cycling infrastructure, active transport, pedestrianisation,
+# shared micro-mobility, and related urban policy IN A CITY CONTEXT.
+#
+# OUT OF SCOPE (will be flagged via relevance gate):
+#   - Non-urban cycling (mountain biking, road racing, leisure routes)
+#   - Mass transit (bus, metro, tram) as the primary subject
+#   - Ecological/green spaces (parks, trees) without a mobility connection
+#   - Community/neighbourhood events without mobility content
+#   - General urban policy (housing, education, health) without mobility link
 
 labels:
   - infraestructura ciclista
   - carril bici
-  - aparcamiento de bicicletas
-  - zonas de bajas emisiones
-  - patinete eléctrico y VMP
-  - movilidad compartida
-  - transporte público
+  - accidente de tráfico
+  - presupuesto municipal
+  - movilidad sostenible
+  - regulación de movilidad
+  - evento de movilidad
+  - contaminación urbana
   - peatonalización
-  - seguridad vial
-  - política de movilidad
-  - accidentalidad y siniestralidad
-  - logística urbana sostenible
-  - infraestructura peatonal
+  - obras de movilidad
   - bicicleta eléctrica
-  - intermodalidad
+  - aparcamiento de bicicletas
+  - tráfico rodado
+  - seguridad vial
+  - transporte activo
+  - patinete eléctrico
+  - zonas de bajas emisiones
+  - política de movilidad
+  - urbanismo táctico
+  - opinión y debate
 
+multi_label: true
+score_threshold: 0.5
+top_k: 3
+
+# Relevance gate: the article must score >= relevance_threshold on this hypothesis
+# to be considered in-scope. Tune this value using the eval notebook.
+relevance_hypothesis: >-
+  Este artículo trata sobre movilidad urbana alternativa: ciclismo en ciudad,
+  bicicletas, patinetes, peatonalización, infraestructura para transporte activo
+  o política de movilidad sostenible urbana.
+relevance_threshold: 0.4
+
+# Blacklist labels: NLI hypotheses for known out-of-scope clusters.
+# Checked in the same NLI call as the topic labels. If any scores above
+# blacklist_threshold the article is immediately flagged out_of_scope=true,
+# even if it passed the relevance gate.
+# Add new entries when the eval notebook reveals a recurring false-positive cluster.
+blacklist_threshold: 0.7
+blacklist_labels:
+  - Este artículo trata sobre ciclismo deportivo, competición ciclista o carreras de bicicletas.
+  - Este artículo trata sobre senderismo, montañismo o deporte en la naturaleza sin relación con la movilidad urbana.
+  - Este artículo trata sobre un evento deportivo o competición atlética, sin relación con infraestructura urbana.
+
+# Geographic scope classification: separate 3-way exclusive NLI pass.
+# Premise: summary + serialised city evidence + source profile context.
+# The hypothesis with the highest score above scope_threshold wins.
+scope_threshold: 0.35
 scope_hypotheses:
   national: >
     Este artículo trata sobre una política, regulación o iniciativa de movilidad

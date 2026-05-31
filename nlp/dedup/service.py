@@ -1,43 +1,145 @@
+# nlp_service/nlp/dedup/service.py
+import logging
+import os
+import threading
+
 import numpy as np
-import faiss
-from datasketch import MinHashLSH
 
-from nlp.dedup.persistence import (
-    load_minhash, save_minhash, load_faiss, save_faiss,
-    text_to_minhash, EMBED_DIM,
-)
+from . import persistence
 
-COSINE_THRESHOLD = 0.92
+log = logging.getLogger(__name__)
 
-_lsh: MinHashLSH | None = None
-_faiss_index: faiss.IndexFlatIP | None = None
-_faiss_ids: list[str] = []
+_PERSIST_EVERY_N = int(os.environ.get("DEDUP_PERSIST_EVERY_N", "10"))
 
-
-def startup() -> None:
-    global _lsh, _faiss_index, _faiss_ids
-    _lsh = load_minhash()
-    _faiss_index, _faiss_ids = load_faiss()
+_mh = None
+_emb = None
+_ids = None
+_indexings_since_flush = 0
+_lock = threading.Lock()
 
 
-def check_minhash(article_id: str, text: str) -> str | None:
-    m = text_to_minhash(text)
-    results = _lsh.query(m)
-    if results:
-        return results[0]
-    _lsh.insert(article_id, m)
-    save_minhash(_lsh)
-    return None
+def load() -> None:
+    global _mh, _emb, _ids
+    if _mh is None:
+        _mh, _emb, _ids = persistence.load_all()
 
 
-def check_embedding(article_id: str, embedding: np.ndarray) -> str | None:
-    vec = embedding.reshape(1, -1).astype(np.float32)
-    if _faiss_index.ntotal > 0:
-        distances, indices = _faiss_index.search(vec, 1)
-        if distances[0][0] >= COSINE_THRESHOLD:
-            return _faiss_ids[indices[0][0]]
+def flush() -> None:
+    """Explicit flush — also called from the SIGTERM handler."""
+    if _mh is not None and _emb is not None and _ids is not None:
+        persistence.save_all(_mh, _emb, _ids)
 
-    _faiss_index.add(vec)
-    _faiss_ids.append(article_id)
-    save_faiss(_faiss_index, _faiss_ids)
-    return None
+
+def _maybe_flush() -> None:
+    global _indexings_since_flush
+    _indexings_since_flush += 1
+    if _indexings_since_flush >= _PERSIST_EVERY_N:
+        try:
+            flush()
+        except Exception:
+            log.exception("periodic dedup flush failed; will retry next cycle")
+        else:
+            _indexings_since_flush = 0
+
+
+def check_minhash_only(article_id: str, text: str) -> dict:
+    """Stage 1 (pipeline step 1): MinHash check only. Adds to minhash index on miss."""
+    load()
+    with _lock:
+        assert _mh is not None and _ids is not None
+
+        if _ids.has(article_id):
+            return {"duplicate_of": article_id, "stage": "minhash", "score": 1.0,
+                    "indexed": False}
+
+        best_aid, best_jaccard = _mh.query(text)
+        if best_aid is not None and best_jaccard >= _mh.threshold:
+            return {"duplicate_of": best_aid, "stage": "minhash",
+                    "score": float(best_jaccard), "indexed": False}
+
+        _mh.add(article_id, text)
+        _maybe_flush()
+        return {"duplicate_of": None, "stage": None, "score": None, "indexed": True}
+
+
+def check_embedding_vec(article_id: str, vec: np.ndarray) -> dict:
+    """Stage 2 (pipeline step 3): Embedding check with pre-computed vector from /extract.
+    Adds to FAISS index on miss. article_id must already be in minhash index.
+    """
+    load()
+    with _lock:
+        assert _emb is not None and _ids is not None
+
+        best_row, best_cosine = _emb.query_vec(vec)
+        if best_row is not None and best_cosine >= _emb.threshold:
+            dup_aid = _ids.article_id_for(best_row)
+            if dup_aid is None:
+                log.error("FAISS row %d has no IdMap entry; index may be corrupt", best_row)
+                raise RuntimeError(f"dedup index inconsistency: row {best_row} unmapped")
+            return {"duplicate_of": dup_aid, "stage": "embedding",
+                    "score": float(best_cosine), "indexed": False}
+
+        emb_row = _emb.add_vec(vec)
+        mapped_row = _ids.add(article_id)
+        assert emb_row == mapped_row, "IdMap and FAISS row counters drifted apart"
+        _maybe_flush()
+        return {"duplicate_of": None, "stage": None, "score": None, "indexed": True}
+
+
+def check(article_id: str, text: str) -> dict:
+    """Returns the DedupResponse payload as a plain dict."""
+    load()
+    with _lock:
+        assert _mh is not None and _emb is not None and _ids is not None
+
+        # Already seen — treat as duplicate of itself (don't re-add).
+        if _ids.has(article_id):
+            return {"duplicate_of": article_id, "stage": "minhash", "score": 1.0,
+                    "indexed": False}
+
+        # Stage 1: MinHash LSH
+        best_aid, best_jaccard = _mh.query(text)
+        if best_aid is not None and best_jaccard >= _mh.threshold:
+            return {"duplicate_of": best_aid, "stage": "minhash",
+                    "score": float(best_jaccard), "indexed": False}
+
+        # Stage 2: Embedding
+        best_row, best_cosine = _emb.query(text)
+        if best_row is not None and best_cosine >= _emb.threshold:
+            dup_aid = _ids.article_id_for(best_row)
+            if dup_aid is None:
+                log.error("FAISS row %d has no IdMap entry; index may be corrupt", best_row)
+                raise RuntimeError(f"dedup index inconsistency: row {best_row} unmapped")
+            return {"duplicate_of": dup_aid, "stage": "embedding",
+                    "score": float(best_cosine), "indexed": False}
+
+        # Not a duplicate — index it.
+        _mh.add(article_id, text)
+        _emb_row = _emb.add(text)
+        mapped_row = _ids.add(article_id)
+        assert _emb_row == mapped_row, "IdMap and FAISS row counters drifted apart"
+        _maybe_flush()
+        return {"duplicate_of": None, "stage": None, "score": None, "indexed": True}
+
+
+def bootstrap(articles: list[dict]) -> dict:
+    """Rebuild indexes from a list of {article_id, text}."""
+    global _mh, _emb, _ids, _indexings_since_flush
+    from . import minhash_index, embedding_index, id_map
+    with _lock:
+        _mh = minhash_index.MinHashIndex()
+        _emb = embedding_index.EmbeddingIndex()
+        _ids = id_map.IdMap()
+        _indexings_since_flush = 0
+    duplicates_found = 0
+    indexed = 0
+    for art in articles:
+        result = check(art["article_id"], art["text"])
+        if result["duplicate_of"] is not None:
+            duplicates_found += 1
+        if result["indexed"]:
+            indexed += 1
+    flush()
+    with _lock:
+        _indexings_since_flush = 0
+    return {"processed": len(articles), "duplicates_found": duplicates_found, "indexed": indexed}

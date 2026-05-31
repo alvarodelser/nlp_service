@@ -1,0 +1,13 @@
+.DS_Store
+**/.DS_Store
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+*.env
+data/
+/data/
+*.pkl
+*.index
+.venv/
+venv/

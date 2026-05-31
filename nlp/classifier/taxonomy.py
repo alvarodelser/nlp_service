@@ -1,28 +1,42 @@
+# nlp_service/nlp/classifier/taxonomy.py
 import os
+from dataclasses import dataclass
+from pathlib import Path
+
 import yaml
 
-TOPICS_PATH = os.getenv("TOPICS_YAML_PATH", "config/topics.yaml")
-
-_config: dict = {}
-
-
-def startup() -> None:
-    global _config
-    with open(TOPICS_PATH, encoding="utf-8") as f:
-        _config = yaml.safe_load(f)
+_CONFIG_PATH = Path(os.environ.get("TOPICS_YAML_PATH", "/app/config/topics.yaml"))
+_taxonomy: "Taxonomy | None" = None
 
 
-def labels() -> list[str]:
-    return _config.get("labels", [])
+@dataclass
+class Taxonomy:
+    labels: list[str]
+    multi_label: bool
+    score_threshold: float
+    top_k: int
+    relevance_hypothesis: str
+    relevance_threshold: float
+    blacklist_labels: list[str]
+    blacklist_threshold: float
+    scope_hypotheses: dict[str, str]   # {scope_name: hypothesis_text}
+    scope_threshold: float
 
 
-def nli_threshold() -> float:
-    return float(_config.get("nli_threshold", 0.30))
-
-
-def scope_threshold() -> float:
-    return float(_config.get("scope_threshold", 0.35))
-
-
-def scope_hypotheses() -> dict[str, str]:
-    return _config.get("scope_hypotheses", {})
+def load() -> Taxonomy:
+    global _taxonomy
+    if _taxonomy is None:
+        data = yaml.safe_load(_CONFIG_PATH.read_text(encoding="utf-8"))
+        _taxonomy = Taxonomy(
+            labels=data["labels"],
+            multi_label=bool(data.get("multi_label", True)),
+            score_threshold=float(data.get("score_threshold", 0.5)),
+            top_k=int(data.get("top_k", 3)),
+            relevance_hypothesis=str(data.get("relevance_hypothesis", "")),
+            relevance_threshold=float(data.get("relevance_threshold", 0.4)),
+            blacklist_labels=list(data.get("blacklist_labels", [])),
+            blacklist_threshold=float(data.get("blacklist_threshold", 0.7)),
+            scope_hypotheses=dict(data.get("scope_hypotheses", {})),
+            scope_threshold=float(data.get("scope_threshold", 0.35)),
+        )
+    return _taxonomy
