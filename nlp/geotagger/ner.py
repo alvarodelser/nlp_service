@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 from transformers import pipeline as hf_pipeline
 
-_MODEL = "PlanTL-GOB-ES/roberta-base-bne-ner-capiter"
+_MODEL = "mrm8488/bert-spanish-cased-finetuned-ner"
 _ner_pipeline = None
 _KEEP_LABELS = {"LOC"}
 

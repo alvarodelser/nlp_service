@@ -14,7 +14,7 @@ RUN python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('s
 
 # Pre-pull NLP models so first request is fast (~2 GB total)
 # NER: PlanTL RoBERTa fine-tuned on Spanish news
-RUN python -c "from transformers import pipeline; pipeline('token-classification', model='PlanTL-GOB-ES/roberta-base-bne-ner-capiter', aggregation_strategy='simple')"
+RUN python -c "from transformers import pipeline; pipeline('token-classification', model='mrm8488/bert-spanish-cased-finetuned-ner', aggregation_strategy='simple')"
 # Relevance + scope + topic classification (NLI)
 RUN python -c "from transformers import pipeline; pipeline('zero-shot-classification', model='Recognai/bert-base-spanish-wwm-cased-xnli')"
 # Dedup + semantic embeddings
