@@ -1,33 +1,27 @@
-# NLP Pipeline for Alternative Mobility News Processing
-### Masters NLP Seminar — Technical Report
+# NLP Pipeline for Mobility News Processing
+### Seminar 14 — Procesamiento de Lenguaje Natural
 
 ---
 
-## Abstract
-
-This report describes a modular natural language processing service designed to ingest, deduplicate, summarise, classify, and geotag Spanish-language news articles about alternative urban mobility. The system targets a community forum platform that aggregates coverage of cycling infrastructure, micro-mobility, and sustainable transport policy across Spain. A sequential pipeline coordinates six independent NLP endpoints — extraction and embedding, deduplication, summarisation, geographic entity resolution, and a fused topic and scope classifier — each exposed as a self-contained REST endpoint and backed by a dedicated model stack. Cost-aware ordering ensures that the most expensive operations (LLM generation, ~47 s per article) only run on articles that pass cheaper upstream gates. The classifier fuses the generated summary, resolved geographic evidence, a source profile, and the scraper's original search tags into a single joint inference step for both topic tagging and geographic scope determination. The orchestrator accumulates all results in memory, validates and retries the LLM output, and writes a single atomic database record only on full pipeline completion. The service is deployed as a Docker container alongside a locally-hosted large language model, accessed entirely through a typed HTTP API.
+This report describes a modular natural language processing service designed to ingest, deduplicate, summarise, classify, and geotag Spanish-language news articles about alternative urban mobility. The system is intended to seed with data a community forum. The service is deployed as a Docker container alongside a locally-hosted large language model, accessed entirely through a typed HTTP API. For generative requests it makes use of ollama hosted on a separate container.
 
 ---
 
-## 1. Introduction and Motivation
+## 1. Introduction
 
-Online communities focused on sustainable transport face a common editorial problem: the same news event is reported by dozens of sources, coverage ranges from hyper-local (a new cycle lane in a specific district) to national policy announcements, and the geographic and thematic context varies widely. Manual curation at scale is not feasible.
+Participatory platforms face a common engagement problem: users do not engage long-term. I propose this may be due to a lack of focus on a singular problem they face and which they are engaged with and a lack of useful tools, such as an aggregated view of news regarding that specific topic. To design an aggregator of national and local news of a specific topic, a NLP pipeline is required.
 
-The service described here automates the ingestion pipeline for a Spanish urban mobility forum. Every incoming article passes through a sequence of NLP operations that (a) detect whether it has already been processed under a different byline, (b) assess whether it is relevant to the platform's editorial scope, (c) generate a compact LLM summary, (d) resolve all place mentions to structured geographic entities, and (e) assign multi-label topic tags and a geographic scope from a joint inference step that fuses textual, geographic, and editorial signals.
+The service described here automates the ingestion pipeline for a Spanish urban mobility forum. Every incoming article passes through a sequence of NLP operations that (a) detect whether the news story has already been processed, (b) assess whether it is relevant to the platform's scope, (c) generate a summary, (d) resolve all place mentions to geographic entities, and (e) assign multi-label topic tags and a geographic scope: national or regional.
 
-The resulting enriched record supports downstream features including geographic search, topic filtering, article deduplication in the frontend, and vector-similarity-based content recommendations.
+The resulting record supports features including geographic search, topic filtering, and vector-similarity-based content recommendations.
 
-The design follows three engineering principles:
-
-- **Minimal coupling.** Each NLP endpoint operates as an independent microservice. The orchestrating pipeline is not aware of model internals; it only sends HTTP requests and reads typed responses.
-- **Cost-aware ordering.** Expensive steps are gated behind cheap ones. An article that is a duplicate or out of scope never reaches the LLM.
-- **Signal fusion at inference time.** Rather than classifying scope from summary text alone and then reconciling with geographic evidence in a post-hoc imputation step, all available evidence — textual, geographic, and editorial — is assembled into a single joint inference call. This removes the imputation heuristic and gives the NLI model visibility over all signals at once.
+Each NLP endpoint operates as an independent microservice. 
 
 ---
 
-## 2. System Architecture Overview
+## 2. System Architecture
 
-The system is composed of six independent NLP endpoints, a thin orchestration layer, and a PostgreSQL database extended with a vector index. An Ollama instance, running as a Docker sidecar, hosts the generative LLM used by the summariser.
+The system is composed of six endpoints, a thin orchestration layer, results are stored in a PostgreSQL database extended with a vector index. An Ollama instance is required, running in Docker sidecar, hosts the generative LLM used by the summariser. For testing we provide a notebook with mock data for each endpoint, and a complete pipeline notebook. They can be run in any local machine with connection to the web providing the appropiate API key and url in a .env.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -50,11 +44,11 @@ The system is composed of six independent NLP endpoints, a thin orchestration la
                        └─────────────────────────┘
 ```
 
-All six endpoints are implemented as FastAPI routers within a single deployable service, sharing model instances loaded once at startup. The orchestrator is a separate process — a cron job or event-driven ingestion script — that calls the service's HTTP API, accumulates results in memory, and performs exactly one database write per article on the success path.
+All six endpoints are implemented as FastAPI routers within a single deployable service, sharing model instances loaded once at startup. The orchestrator will be a separate process that calls the service's HTTP API, accumulates results in memory, and performs a database write at the end.
 
 ---
 
-## 3. NLP Module Architecture
+## 3. NLP Modules
 
 The diagram below shows the internal processing steps of each endpoint.
 

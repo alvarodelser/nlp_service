@@ -13,6 +13,7 @@ services:
       DEDUP_EMBED_THRESHOLD: "0.85"
       DEDUP_PERSIST_EVERY_N: "10"
       DEDUP_DATA_DIR: /data/dedup
+      OLLAMA_TIMEOUT: "${OLLAMA_TIMEOUT:-120}"
       NLP_LOG_LEVEL: INFO
     volumes:
       - nlp_dedup_data:/data/dedup

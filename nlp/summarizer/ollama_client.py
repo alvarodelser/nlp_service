@@ -38,7 +38,10 @@ def _call_once(prompt: str, timeout: float) -> dict[str, Any]:
     return json.loads(body["response"])
 
 
-def generate(prompt: str, max_retries: int = 3, timeout: float = 30.0) -> dict[str, Any]:
+_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "120"))
+
+
+def generate(prompt: str, max_retries: int = 3, timeout: float = _TIMEOUT) -> dict[str, Any]:
     """Forced-JSON Ollama call. Returns dict with `headline` and `summary` keys.
 
     Raises the last httpx error if all retries fail.
