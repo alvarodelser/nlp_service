@@ -24,7 +24,7 @@ Understanding what exists before touching anything.
 raw article { article_id, text, headline, source }
 │
 ├─► POST /extract
-│     TF-IDF sentence ranking → extract (≤200 words)
+│     TextRank sentence ranking → extract (≤200 words)
 │     MiniLM encode(extract) → embedding_raw (384-dim)
 │     │
 │     ├─► POST /dedup-check-embed          (uses embedding_raw from /extract)
@@ -48,10 +48,11 @@ raw article { article_id, text, headline, source }
       → { geo_scope, geo_cities, geo_streets, geo_points, all_places }
 ```
 
-### 1.3 API contract (unchanged by this spec)
+### 1.3 API contract changes
 
-All request/response models in `api/models.py` remain identical. The only observable
-change is better geo output quality.
+One model change: `ClassifyRequest` gains an optional `geo_scope` field (see §9.1).
+All other request/response models are unchanged. The only other observable difference
+is better geo output quality.
 
 ---
 
@@ -177,7 +178,7 @@ calls, not a separate module's responsibility.
 
 All NLI calls go through the shared `nlp.nli.classify()`.
 
-### 4.1 Inputs (inside service.py `run()`)
+### 5.1 Inputs (inside service.py `run()`)
 
 After Stage B1 gazetteer lookups, `service.py` has:
 - `spans_with_geo`: list of `(span_text, [GeoEntry, ...])` — same as today
@@ -187,7 +188,7 @@ Candidate pools derived from `spans_with_geo`:
 - `city_pool`: spans where best GeoEntry has `feature_class == "P"` AND matches a cities-DB entry
 - `region_pool`: spans where best GeoEntry has `feature_class == "A"`
 
-### 4.2 Stage 1 — Geographic scope (always runs)
+### 5.2 Stage 1 — Geographic scope (always runs)
 
 **Goal:** Is this article about a single city, a region, or a national topic?
 
@@ -232,7 +233,7 @@ H_NATIONAL = (
 **Fallback:** If `max(scores) < SCOPE_CONFIDENCE_THRESHOLD` (default 0.35), fall back to
 heuristic: `city` if city_pool non-empty, `regional` if region_pool non-empty, else `national`.
 
-### 4.3 Stage 2a — City selection (only if Stage 1 = local)
+### 5.3 Stage 2a — City selection (only if Stage 1 = local)
 
 **Skip condition:** If `len(city_pool) <= 1`, return the single candidate directly (or None).
 
@@ -261,7 +262,7 @@ the label set).
 
 **Output:** `CityHit` for the winning city, or `None` if all scores below threshold.
 
-### 4.4 Stage 2b — Region selection (only if Stage 1 = regional)
+### 5.4 Stage 2b — Region selection (only if Stage 1 = regional)
 
 **Skip condition:** If `len(region_pool) <= 1`, return the single candidate directly.
 
@@ -278,7 +279,7 @@ REGION_TEMPLATE = (
 
 **Output:** `geo_region` string (name of the region), no `CityHit`.
 
-### 4.5 Combined result (inside service.py)
+### 5.5 Combined result (inside service.py)
 
 After both stages, `service.py` holds:
 - `geo_scope` ∈ `{"national", "regional", "city"}` — Stage 1's `"local"` maps to `"city"`
@@ -436,11 +437,14 @@ They should generally agree but can legitimately diverge. Example: a Barcelona c
 study covered by a national newspaper → geotagger says `city`, classifier might say
 `national` (policy significance). Both are valid in their dimension.
 
-**Recommendation:** Keep both. Document the distinction clearly. In the E2E pipeline,
-the client should use `/geotag`'s `geo_scope` for geographic filtering and `/classify`'s
-`geo_scope` for editorial/relevance ranking.
+**Resolution:** `ClassifyRequest` gains an optional `geo_scope: str | None = None` field.
+When the E2E pipeline has already called `/geotag`, it passes `geo_scope` from that
+response into `/classify`. The classifier skips its own `_scope_pass` NLI when
+`geo_scope` is provided, using it directly. When `geo_scope` is absent (e.g. quick
+classification without geotag), the classifier runs its own scope NLI as today.
 
-**No code change needed** — just documentation alignment.
+This makes the geotagger the authoritative geographic source while preserving the
+classifier's independent scope signal for callers that don't run geotag.
 
 ### 9.2 XNLI model token limit
 
@@ -511,8 +515,10 @@ RUN python -c "from flair.models import SequenceTagger; SequenceTagger.load('fla
 
 ## 11. Eval Notebook Impact
 
-No changes to `api/models.py` means no changes to eval notebooks. The geotag eval
-notebook (`03_geotag_eval.ipynb`) will show the same output format; accuracy scores
+The only API model change is an optional `geo_scope` field on `ClassifyRequest` —
+backward compatible, no notebook changes required. The E2E notebook (`06_e2e_pipeline.ipynb`)
+should be updated to pass `geo_scope` from the geotag response into the classify call.
+The geotag eval notebook (`03_geotag_eval.ipynb`) output format is unchanged; accuracy
 should improve for all 6 currently-failing cases.
 
 Expected pass rate: 8–10/10 (geo-006 "La Rambla → Barcelona" remains uncertain — the
