@@ -21,7 +21,6 @@ _CITIES_PATH = Path(os.environ.get(
 ))
 _cities: list[dict] = []
 _by_name: dict[str, dict] = {}
-_max_population = 1
 
 _H_LOCAL = (
     "Este artículo describe actuaciones, obras o iniciativas "
@@ -61,7 +60,7 @@ def _normalize(s: str) -> str:
 
 
 def _load_cities() -> None:
-    global _cities, _by_name, _max_population
+    global _cities, _by_name
     if _cities:
         return
     if not _CITIES_PATH.exists():
@@ -71,8 +70,6 @@ def _load_cities() -> None:
         _by_name[_normalize(c["name"])] = c
         if c.get("alt_name"):
             _by_name[_normalize(c["alt_name"])] = c
-    if _cities:
-        _max_population = max(c.get("population") or 1 for c in _cities)
 
 
 def _match_city(geo_entry: gazetteer.GeoEntry) -> dict | None:
@@ -246,14 +243,15 @@ def run(
 
     geo_points: list[dict] = []
     for _span_text, entries in spans_with_geo:
-        for entry in entries:
-            if entry.feature_class == "P" and not city_hit:
-                best = max(entries, key=lambda x: x.population)
-                geo_points.append({
-                    "span": _span_text, "lat": best.lat, "lon": best.lon,
-                    "geonames_id": best.geonames_id,
-                })
-                break
+        if city_hit:
+            continue
+        p_entries = [e for e in entries if e.feature_class == "P"]
+        if p_entries:
+            best = max(p_entries, key=lambda x: x.population)
+            geo_points.append({
+                "span": _span_text, "lat": best.lat, "lon": best.lon,
+                "geonames_id": best.geonames_id,
+            })
 
     geo_cities: list[dict] = []
     if city_hit:

@@ -33,7 +33,12 @@ def run(
     topic_premise = tag_prefix + summary
 
     all_labels = tax.labels + tax.blacklist_labels
-    raw = model.classify(topic_premise, labels=all_labels, multi_label=True)
+    raw = model.classify(
+        topic_premise,
+        labels=all_labels,
+        multi_label=True,
+        hypothesis_template="Este texto trata sobre {}.",
+    )
     scored = dict(zip(raw["labels"], raw["scores"]))
 
     if tax.blacklist_labels:
