@@ -20,5 +20,6 @@ def extract_top_sentences(text: str, n: int) -> str:
     _ensure_loaded()
     tokenizer = Tokenizer(_LANGUAGE)  # per-call; Tokenizer holds mutable state
     parser = PlaintextParser.from_string(text, tokenizer)
-    sentences = _summarizer(parser.document, n)
-    return " ".join(str(s) for s in sentences)
+    sentences = _summarizer(parser.document, max(1, n))
+    result = " ".join(str(s) for s in sentences)
+    return result if result.strip() else text
