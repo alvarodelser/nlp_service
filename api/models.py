@@ -95,6 +95,7 @@ class ClassifyRequest(BaseModel):
     geo_cities: list[GeoCity] = []
     search_tags: list[str] = []
     source_profile: SourceProfile | None = None
+    geo_scope: str | None = None
 
 
 class ClassifyResponse(BaseModel):

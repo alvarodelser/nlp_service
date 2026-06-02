@@ -22,6 +22,7 @@ def classify(req: ClassifyRequest) -> ClassifyResponse:
             geo_cities=[c.model_dump() for c in req.geo_cities],
             search_tags=req.search_tags,
             source_profile=req.source_profile.model_dump() if req.source_profile else None,
+            geo_scope=req.geo_scope,
         )
     except FileNotFoundError as exc:
         log.error("topics.yaml missing: %s", exc, extra={"article_id": req.article_id})

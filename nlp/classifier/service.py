@@ -13,6 +13,7 @@ def run(
     geo_cities: list[dict] | None = None,
     search_tags: list[str] | None = None,
     source_profile: dict | None = None,
+    geo_scope: str | None = None,
 ) -> dict:
     tax = taxonomy.load()
     geo_cities = geo_cities or []
@@ -23,7 +24,7 @@ def run(
         rel = model.classify(summary, labels=[tax.relevance_hypothesis], multi_label=True)
         rel_score = rel["scores"][0] if rel["scores"] else 0.0
         if rel_score < tax.relevance_threshold:
-            return {"topics": [], "scores": {}, "geo_scope": "national", "out_of_scope": True}
+            return {"topics": [], "scores": {}, "geo_scope": geo_scope or "national", "out_of_scope": True}
 
     # Topic NLI: premise is search_tags + summary (search tags act as editorial prior)
     tag_prefix = ""
@@ -38,7 +39,7 @@ def run(
     if tax.blacklist_labels:
         top_blacklist_score = max(scored.get(lbl, 0.0) for lbl in tax.blacklist_labels)
         if top_blacklist_score >= tax.blacklist_threshold:
-            return {"topics": [], "scores": scored, "geo_scope": "national", "out_of_scope": True}
+            return {"topics": [], "scores": scored, "geo_scope": geo_scope or "national", "out_of_scope": True}
 
     filtered = sorted(
         [(lbl, scored[lbl]) for lbl in tax.labels if scored.get(lbl, 0) >= tax.score_threshold],
@@ -46,12 +47,12 @@ def run(
     )[:tax.top_k]
 
     # Scope NLI: separate 3-way exclusive pass with assembled geographic evidence
-    geo_scope = _scope_pass(summary, geo_cities, source_profile, tax)
+    resolved_scope = geo_scope or _scope_pass(summary, geo_cities, source_profile, tax)
 
     return {
         "topics": [lbl for lbl, _ in filtered],
         "scores": {lbl: scored[lbl] for lbl in tax.labels},
-        "geo_scope": geo_scope,
+        "geo_scope": resolved_scope,
         "out_of_scope": False,
     }
 
