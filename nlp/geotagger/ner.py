@@ -1,12 +1,21 @@
-# nlp_service/nlp/geotagger/ner.py
+import os
 import re
 from dataclasses import dataclass, field
 
-from transformers import pipeline as hf_pipeline
+try:
+    import torch
+    import flair
+    from flair.models import SequenceTagger
+    from flair.data import Sentence as FlairSentence
+    flair.device = torch.device(os.environ.get("NER_DEVICE", "cpu"))
+    _FLAIR_AVAILABLE = True
+except ImportError:
+    _FLAIR_AVAILABLE = False
+    SequenceTagger = None
+    FlairSentence = None
 
-_MODEL = "mrm8488/bert-spanish-cased-finetuned-ner"
-_ner_pipeline = None
 _KEEP_LABELS = {"LOC"}
+_tagger = None
 
 _STREET_RE = re.compile(
     r'(?:^|(?<=\s))'
@@ -23,50 +32,47 @@ class Span:
     label: str
     start_char: int
     end_char: int
-    hint: str = ""   # "street" when matched by prefix regex
+    hint: str = ""
 
 
 def _ensure_loaded() -> None:
-    global _ner_pipeline
-    if _ner_pipeline is None:
-        _ner_pipeline = hf_pipeline(
-            "token-classification",
-            model=_MODEL,
-            aggregation_strategy="simple",
-            device=-1,   # CPU; set to 0 for GPU
-        )
+    global _tagger
+    if _tagger is None:
+        if not _FLAIR_AVAILABLE:
+            raise RuntimeError(
+                "flair is not installed. Add flair>=0.13 to requirements.txt "
+                "and rebuild the Docker image."
+            )
+        _tagger = SequenceTagger.load("flair/ner-spanish-large")
 
 
 def extract_spans(text: str) -> list[Span]:
     _ensure_loaded()
-    assert _ner_pipeline is not None
+    assert _tagger is not None
 
-    # Stage A1: transformer NER
-    raw = _ner_pipeline(text)
+    sentence = FlairSentence(text, use_tokenizer=True)
+    _tagger.predict(sentence)
+
     ner_spans: list[Span] = [
         Span(
-            text=e["word"],
-            label=e["entity_group"],
-            start_char=e["start"],
-            end_char=e["end"],
+            text=entity.text,
+            label=entity.tag,
+            start_char=entity.start_position,
+            end_char=entity.end_position,
         )
-        for e in raw
-        if e["entity_group"] in _KEEP_LABELS
+        for entity in sentence.get_spans("ner")
+        if entity.tag in _KEEP_LABELS
     ]
 
-    # Track covered char ranges to avoid double-counting
     covered: set[tuple[int, int]] = {(s.start_char, s.end_char) for s in ner_spans}
 
-    # Stage A2: street-prefix regex (post-NER layer)
     street_spans: list[Span] = []
     for m in _STREET_RE.finditer(text):
         start, end = m.start(), m.end()
-        # skip if already covered by NER
         if any(s <= start < e or s < end <= e for s, e in covered):
             continue
-        full_match = m.group(0).strip()
         street_spans.append(Span(
-            text=full_match,
+            text=m.group(0).strip(),
             label="LOC",
             start_char=start,
             end_char=end,
