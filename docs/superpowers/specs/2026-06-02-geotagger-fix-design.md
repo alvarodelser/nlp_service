@@ -94,44 +94,98 @@ GeoNames feature codes (see §4).
 
 ```
 nlp/
-  nli.py                    ← NEW: shared NLI wrapper (extracted from classifier/model.py)
+  nli.py                        ← NEW: shared NLI wrapper (extracted from classifier/model.py)
+  extractor/
+    service.py                  ← PATCH: replace TF-IDF sentence ranking with TextRank
+    extractive.py               ← MOVE from nlp/summarizer/extractive.py (same code, new home)
   geotagger/
-    ner.py                  ← REWRITE: HF pipeline → Flair SequenceTagger
-    service.py              ← PATCH: Bug 2 (street routing rescue)
-    disambiguator.py        ← REWRITE: rule-based scorer → 2-level NLI cascade
+    ner.py                      ← REWRITE: HF pipeline → Flair SequenceTagger
+    service.py                  ← REWRITE: absorbs all geo-classification logic;
+                                   calls nli.classify() for scope + city selection;
+                                   Bug 2 street routing rescue included
+    disambiguator.py            ← DELETE: replaced by NLI calls in service.py
+  summarizer/
+    extractive.py               ← DELETE: moved to nlp/extractor/extractive.py
   classifier/
-    model.py                ← SIMPLIFY: thin import shim over nlp.nli
+    model.py                    ← SIMPLIFY: thin import shim over nlp.nli
 
-requirements.txt            ← add flair>=0.13
-Dockerfile                  ← update model pre-pull
-api/main.py                 ← add flair device init to lifespan
+api/models.py                   ← PATCH: add optional geo_scope field to ClassifyRequest
+requirements.txt                ← add flair>=0.13; remove sklearn (TF-IDF gone); keep sumy
+Dockerfile                      ← update model pre-pull
+api/main.py                     ← add flair device init to lifespan
 ```
 
 ### Files NOT changed
 
-`gazetteer.py`, `api/models.py`, all routers, `encoder.py`, `extractor/`, `summarizer/`,
-`dedup/`, `config/topics.yaml`, `api/warmth.py`.
+`gazetteer.py`, all routers except classify (no router change — model change only),
+`encoder.py`, `dedup/`, `config/topics.yaml`, `api/warmth.py`.
 
 ---
 
-## 4. NLI Disambiguation Design (disambiguator.py rewrite)
+## 4. Extractor: TF-IDF → TextRank (nlp/extractor/service.py)
 
-This is the heart of the change. All NLI calls go through the shared `nlp.nli.classify()`.
+### Why
 
-### 4.1 Inputs
+TF-IDF in `extractor/service.py` fits a vectoriser on 5–10 sentences from the same
+article. With such a small corpus the IDF component is meaningless — it degenerates
+into a raw word-frequency ranker. `nlp/summarizer/extractive.py` already has a correct
+TextRank implementation (sumy `TextRankSummarizer`) that considers inter-sentence
+similarity via a graph, producing more coherent and representative sentence selections.
+
+### Change
+
+Move `nlp/summarizer/extractive.py` → `nlp/extractor/extractive.py` (no code change,
+just relocation to the module that actually uses it).
+
+Replace the TF-IDF body in `extractor/service.py` with a call to `extract_top_sentences`,
+preserving the same `max_words` contract:
 
 ```python
-def resolve(
-    spans_with_geo: list[tuple[str, list[GeoEntry]]],  # from gazetteer lookup
-    full_text: str,
-    headline: str,
-) -> tuple[str, CityHit | None]   # (geo_scope, city_hit_or_none)
+# after
+from nlp.extractor.extractive import extract_top_sentences
+
+def _textrank_extract(text: str, max_words: int) -> str:
+    sentences = _split_sentences(text)
+    if len(sentences) <= 2:
+        return text
+    avg_words = sum(len(s.split()) for s in sentences) / len(sentences)
+    n = max(1, int(max_words / max(avg_words, 1)))
+    return extract_top_sentences(text, n)
 ```
 
-Candidate pools are derived from `spans_with_geo`:
-- `city_pool`: spans where at least one GeoEntry has `feature_class == "P"` and matches a known city
-- `region_pool`: spans where at least one GeoEntry has `feature_class == "A"`
-- `premise`: `f"{headline}. {full_text}"` truncated to the model's token limit (handled automatically by HF pipeline `truncation=True`)
+### What stays the same
+
+- `extract_and_embed()` signature is unchanged
+- `/extract` response fields `extract` and `embedding_raw` are unchanged
+- Ollama receives the same `extract` string (better sentences, same field)
+- Dedup embedding computed from TextRank extract — existing index remains valid,
+  thresholds unchanged
+
+### Dead code removed
+
+`sklearn` import and `_tfidf_extract` deleted from `extractor/service.py`.
+`numpy` import in extractor also removed (was only used by TF-IDF).
+
+---
+
+## 5. Geo-Classification in service.py (replaces disambiguator.py)
+
+`disambiguator.py` is deleted. The NLI scope + city classification moves directly into
+`service.py`, which already holds all the context needed (spans, gazetteer hits, text,
+headline). This removes an unnecessary indirection layer — the logic is two `nli.classify()`
+calls, not a separate module's responsibility.
+
+All NLI calls go through the shared `nlp.nli.classify()`.
+
+### 4.1 Inputs (inside service.py `run()`)
+
+After Stage B1 gazetteer lookups, `service.py` has:
+- `spans_with_geo`: list of `(span_text, [GeoEntry, ...])` — same as today
+- `premise = f"{headline}. {full_text}"` — truncation handled by HF pipeline
+
+Candidate pools derived from `spans_with_geo`:
+- `city_pool`: spans where best GeoEntry has `feature_class == "P"` AND matches a cities-DB entry
+- `region_pool`: spans where best GeoEntry has `feature_class == "A"`
 
 ### 4.2 Stage 1 — Geographic scope (always runs)
 
@@ -224,21 +278,23 @@ REGION_TEMPLATE = (
 
 **Output:** `geo_region` string (name of the region), no `CityHit`.
 
-### 4.5 Combined return
+### 4.5 Combined result (inside service.py)
 
-`disambiguator.resolve()` returns `(geo_scope, city_hit)` where:
-- `geo_scope` ∈ `{"national", "regional", "city"}` — the Stage 1 internal label `"local"`
-  is mapped to `"city"` before returning, matching the existing API contract
-- `city_hit` is a `CityHit` (populated for `city` scope) or `None` (for `regional`/`national`)
+After both stages, `service.py` holds:
+- `geo_scope` ∈ `{"national", "regional", "city"}` — Stage 1's `"local"` maps to `"city"`
+  to match the existing API contract
+- `winning_city` — a `GeoEntry` + cities-DB dict pair, or `None`
+- `geo_region` — an A-class entry name, or `None`
 
-`service.py` calls this once and uses both values directly, replacing the current separate
-`score_candidates` call and `_resolve_scope` imputation.
+`CityHit` dataclass moves into `service.py` (or is inlined) since it's no longer shared
+with a separate disambiguator module. The `_resolve_scope` function in `service.py` is
+**deleted** — scope now comes directly from Stage 1 NLI output.
 
 ---
 
-## 5. NER Module Rewrite (ner.py)
+## 6. NER Module Rewrite (ner.py)
 
-### 5.1 Flair API
+### 6.1 Flair API
 
 ```python
 import os
@@ -259,7 +315,7 @@ def _ensure_loaded() -> None:
         _tagger = SequenceTagger.load("flair/ner-spanish-large")
 ```
 
-### 5.2 Entity extraction
+### 6.2 Entity extraction
 
 ```python
 def _flair_spans(text: str) -> list[Span]:
@@ -280,12 +336,12 @@ def _flair_spans(text: str) -> list[Span]:
 No sub-word handling needed: Flair uses SentencePiece internally and always returns
 clean, complete words.
 
-### 5.3 Street regex stage (unchanged)
+### 6.3 Street regex stage (unchanged)
 
 The `_STREET_RE` regex post-pass runs identically after Flair. The `covered` set prevents
 double-counting when Flair already tagged a street span as LOC.
 
-### 5.4 Startup in main.py
+### 6.4 Startup in main.py
 
 Add to lifespan:
 ```python
@@ -297,11 +353,11 @@ _ner._ensure_loaded()   # already called — no line change needed
 
 ---
 
-## 6. Shared NLI Module (nlp/nli.py)
+## 7. Shared NLI Module (nlp/nli.py)
 
-Currently `nlp/classifier/model.py` is the only NLI entry point. The geotagger
-disambiguator now also needs NLI. Rather than importing across modules (geotagger
-importing from classifier), extract to a shared module.
+Currently `nlp/classifier/model.py` is the only NLI entry point. `geotagger/service.py`
+now also needs NLI calls. Rather than importing across modules (geotagger importing
+from classifier), extract to a shared module.
 
 ```
 nlp/
@@ -309,7 +365,7 @@ nlp/
   classifier/
     model.py      ← becomes a 3-line import shim
   geotagger/
-    disambiguator.py ← imports from nlp.nli
+    service.py    ← imports from nlp.nli directly
 ```
 
 `nlp/nli.py` interface:
@@ -336,7 +392,7 @@ The `_ensure_loaded` function lives in `nlp/nli.py`.
 
 ---
 
-## 7. Street Routing Fix (service.py — Bug 2)
+## 8. Street Routing Fix (service.py — Bug 2)
 
 After the gazetteer lookup loop, before Stage B2:
 
@@ -363,9 +419,9 @@ detected but that have no geonames entry.
 
 ---
 
-## 8. Cross-Cutting Concerns
+## 9. Cross-Cutting Concerns
 
-### 8.1 Dual geo_scope — two sources of truth
+### 9.1 Dual geo_scope — two sources of truth
 
 **Current state:** Both `/geotag` and `/classify` independently compute `geo_scope`.
 
@@ -386,17 +442,7 @@ the client should use `/geotag`'s `geo_scope` for geographic filtering and `/cla
 
 **No code change needed** — just documentation alignment.
 
-### 8.2 Dead code: `nlp/summarizer/extractive.py`
-
-`extractive.py` implements a TextRank extraction pipeline (sumy) but is imported and
-called by nothing. The summarizer uses the TF-IDF extract from `/extract`. This file
-is dead code from an earlier design iteration.
-
-**Recommendation:** Delete `nlp/summarizer/extractive.py` and remove `sumy` from
-`requirements.txt` if present. This is a cleanup outside the scope of this spec but
-should be done in the same PR to avoid confusion.
-
-### 8.3 XNLI model token limit
+### 9.2 XNLI model token limit
 
 `Recognai/bert-base-spanish-wwm-cased-xnli` is a BERT-base model: 512 tokens max.
 NLI input = `[CLS] premise [SEP] hypothesis [SEP]`. A typical hypothesis is ~25 tokens,
@@ -405,7 +451,7 @@ truncated by HF pipeline when `truncation=True` (already the default).
 
 No code change needed. Document the behaviour.
 
-### 8.4 GPU / device configuration
+### 9.3 GPU / device configuration
 
 | Model | Current device | With this spec |
 |---|---|---|
@@ -417,7 +463,7 @@ No code change needed. Document the behaviour.
 Given GPU 0 has ~2.2 GB free and Flair's XLM-R-large weights are ~1.4 GB FP32, GPU
 offload is feasible but tight. Default to CPU; operators can set `NER_DEVICE=cuda:0`.
 
-### 8.5 Warmup (main.py lifespan)
+### 9.4 Warmup (main.py lifespan)
 
 No structural change to the warmup sequence. Flair `_ensure_loaded()` replaces the HF
 pipeline load. `mark_warm("geotag")` fires after both `_ner._ensure_loaded()` and
@@ -425,7 +471,7 @@ pipeline load. `mark_warm("geotag")` fires after both `_ner._ensure_loaded()` an
 
 ---
 
-## 9. Dependencies and Dockerfile
+## 10. Dependencies and Dockerfile
 
 ### requirements.txt
 
@@ -437,9 +483,14 @@ flair>=0.13
 Note: Flair pulls in `torch` (already present via transformers), `gensim`, and several
 other packages. Total image size increase ~200–400 MB.
 
-Remove if present (dead code cleanup):
+Keep (now used by TextRank extractor):
 ```
 sumy
+```
+
+Remove (TF-IDF path deleted):
+```
+scikit-learn
 ```
 
 ### Dockerfile model pre-pull
@@ -458,7 +509,7 @@ RUN python -c "from flair.models import SequenceTagger; SequenceTagger.load('fla
 
 ---
 
-## 10. Eval Notebook Impact
+## 11. Eval Notebook Impact
 
 No changes to `api/models.py` means no changes to eval notebooks. The geotag eval
 notebook (`03_geotag_eval.ipynb`) will show the same output format; accuracy scores
@@ -469,7 +520,7 @@ NLI model may not know La Rambla is a Barcelona landmark without gazetteer enric
 
 ---
 
-## 11. Open Question
+## 12. Open Question
 
 **geo-006 "La Rambla":** Flair will return "Rambla" as a LOC span. The gazetteer has
 no geonames entry for "La Rambla" as a Barcelona street (it's a proper-noun street name
@@ -486,16 +537,19 @@ This is out of scope for this spec. Option 2 is recommended for now.
 
 ---
 
-## 12. Summary of Changes per File
+## 13. Summary of Changes per File
 
 | File | Change | Reason |
 |---|---|---|
 | `nlp/nli.py` | **Create** | Shared NLI singleton; avoids cross-module coupling |
+| `nlp/extractor/extractive.py` | **Create** (move) | TextRank implementation relocated from summarizer/ |
+| `nlp/extractor/service.py` | **Patch** | Replace TF-IDF with TextRank; better sentence selection |
 | `nlp/geotagger/ner.py` | **Rewrite** | Flair replaces HF pipeline; fixes Bugs 1a/1b/1c |
-| `nlp/geotagger/disambiguator.py` | **Rewrite** | 2-level NLI cascade replaces rule-based scorer; fixes Bugs 3+4 |
-| `nlp/geotagger/service.py` | **Patch** (~10 lines) | Street rescue loop; fixes Bug 2 |
+| `nlp/geotagger/service.py` | **Rewrite** | Absorbs NLI scope+city classification; street rescue; fixes Bugs 2/3/4 |
+| `nlp/geotagger/disambiguator.py` | **Delete** | Logic moved into service.py |
+| `nlp/summarizer/extractive.py` | **Delete** (moved) | Now lives at nlp/extractor/extractive.py |
 | `nlp/classifier/model.py` | **Simplify** | Thin import shim over `nlp.nli` |
+| `api/models.py` | **Patch** | Add optional `geo_scope` to `ClassifyRequest` |
 | `api/main.py` | **Patch** (~3 lines) | Flair device init + nli warmup |
-| `requirements.txt` | **Update** | Add flair, remove sumy |
+| `requirements.txt` | **Update** | Add flair; remove scikit-learn; keep sumy |
 | `Dockerfile` | **Update** | Swap model pre-pull |
-| `nlp/summarizer/extractive.py` | **Delete** | Dead code |
