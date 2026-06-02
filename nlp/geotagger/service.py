@@ -93,18 +93,16 @@ def _classify_geo(
     seen_region_names: set[str] = set()
 
     for _span_text, entries in spans_with_geo:
-        if not entries:
-            continue
-        best = max(entries, key=lambda e: e.population)
-        if best.feature_class == "P":
-            city = _match_city(best)
-            if city and city["id"] not in seen_city_ids:
-                city_pool.append((best, city))
-                seen_city_ids.add(city["id"])
-        elif best.feature_class == "A":
-            if best.name not in seen_region_names:
-                region_pool.append(best)
-                seen_region_names.add(best.name)
+        for entry in entries:
+            if entry.feature_class == "P":
+                city = _match_city(entry)
+                if city and city["id"] not in seen_city_ids:
+                    city_pool.append((entry, city))
+                    seen_city_ids.add(city["id"])
+            elif entry.feature_class == "A":
+                if entry.name not in seen_region_names:
+                    region_pool.append(entry)
+                    seen_region_names.add(entry.name)
 
     scope_result = nli.classify(
         premise,
@@ -131,6 +129,12 @@ def _classify_geo(
 
     if geo_scope == "city":
         city_hit = _pick_city(city_pool, premise)
+        if city_hit is None and not city_pool:
+            # NLI scored city scope but no city candidates in gazetteer.
+            # Downgrade to regional or national based on what was actually detected.
+            geo_scope = "regional" if region_pool else "national"
+            if geo_scope == "regional":
+                geo_region = _pick_region(region_pool, premise)
     elif geo_scope == "regional":
         geo_region = _pick_region(region_pool, premise)
 

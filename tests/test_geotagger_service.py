@@ -54,17 +54,19 @@ def test_scope_national_returns_no_city(national_text):
 
 def test_scope_local_single_city_no_stage2(madrid_text):
     from nlp.geotagger.gazetteer import GeoEntry
+    from nlp.geotagger.ner import Span
 
     madrid_entry = GeoEntry(
         geonames_id=3117735, name="Madrid", lat=40.4165, lon=-3.7026,
         feature_class="P", feature_code="PPLC", admin1_code="29", population=3200000,
     )
+    madrid_span = Span(text="Madrid", label="LOC", start_char=19, end_char=25)
 
     with patch("nlp.geotagger.service.ner") as mock_ner, \
          patch("nlp.geotagger.service.gazetteer") as mock_geo, \
          patch("nlp.nli.classify") as mock_nli:
 
-        mock_ner.extract_spans.return_value = []
+        mock_ner.extract_spans.return_value = [madrid_span]
         mock_geo.lookup.side_effect = lambda span: [madrid_entry] if "Madrid" in span else []
         mock_geo.lookup_street.return_value = []
         mock_geo.lookup_street_all_cities.return_value = {}
@@ -78,6 +80,8 @@ def test_scope_local_single_city_no_stage2(madrid_text):
         result = service.run(madrid_text, headline="Carril bici en Madrid", source="")
 
     assert result["geo_scope"] == "city"
+    assert result["geo_cities"][0]["city_name"] == "Madrid"
+    # Stage 2 NLI must NOT fire for a single-candidate city pool
     assert mock_nli.call_count == 1
 
 
