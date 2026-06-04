@@ -262,6 +262,13 @@ description needs a different model, add `ENTITY_DESCRIBE_MODEL` and update
 
 ---
 
+## Testing
+
+See [06-testing.md](06-testing.md) §5 — mock Ollama via `httpx.post`; verify that
+`describe_entity()` passes the entity schema (not the article schema) to `generate()`.
+
+---
+
 ## Dependencies
 
 - No new packages

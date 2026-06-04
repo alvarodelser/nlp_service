@@ -271,9 +271,16 @@ def entity_extract(req: EntityExtractRequest) -> EntityExtractResponse:
 
 ---
 
+## Testing
+
+See [06-testing.md](06-testing.md) §4 — mock Ollama via `httpx.post`; validation logic
+and confidence penalties are tested without any LLM call.
+
+---
+
 ## Dependencies
 
-- `nlp/ontology.py` — for schema and system prompt
+- `nlp/schema.py` — for schema and system prompt
 - Ollama sidecar — same container already used by summarizer
 - `httpx` — already in requirements.txt
 - No new Python packages

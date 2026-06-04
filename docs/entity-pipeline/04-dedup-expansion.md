@@ -363,9 +363,18 @@ assumes the collection already exists and reads from it only.
 
 ---
 
+## Testing
+
+See [06-testing.md](06-testing.md) §3 — `disambiguator.py` is pure logic; candidates
+are passed in so there is no Weaviate or LLM dependency in core tests. Full threshold,
+alias bonus, subtype penalty, and LLM adjudication paths are covered.
+
+---
+
 ## Dependencies
 
-- `weaviate-client>=4.0` — **new package** (Weaviate Python v4 SDK)
+- `weaviate-client>=4.0` — **new package** (Weaviate Python v4 SDK, needed by orchestrator
+  for candidate retrieval; not imported by `disambiguator.py` itself)
 - `nlp/ontology.py`
 - `nlp/entity_encoder.py`
 - Ollama sidecar (LLM adjudication + entity embedding)

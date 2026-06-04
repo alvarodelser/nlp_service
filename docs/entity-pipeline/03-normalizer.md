@@ -240,9 +240,17 @@ MENTIONS
 
 ---
 
+## Testing
+
+See [06-testing.md](06-testing.md) §2 — `merger.py` is fully unit-testable (no LLM);
+LLM clustering is tested with a mocked Ollama response. Key cases: amount summing,
+mixed currency, unresolved endpoints.
+
+---
+
 ## Dependencies
 
-- `nlp/ontology.py` — for entity and relation type enums in schema
+- `nlp/schema.py` — for entity and relation type enums in schema
 - Ollama sidecar
 - `httpx` — already in requirements.txt
 - No new packages

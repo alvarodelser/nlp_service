@@ -514,6 +514,13 @@ reject the whole extraction.
 
 ---
 
+## Testing
+
+See [06-testing.md](06-testing.md) §1 — pure unit tests, no mocking needed.
+Test fixtures: `tests/fixtures/schemas/`.
+
+---
+
 ## Dependencies
 
 - `pyyaml` (already in requirements.txt)
