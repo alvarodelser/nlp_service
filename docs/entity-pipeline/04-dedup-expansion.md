@@ -1,32 +1,32 @@
-# Dedup Module — Weaviate-Backed Rewrite
+# Dedup Module — Unified Weaviate + MinHash Rewrite
 
 ## Purpose of this document
 
-The existing `nlp/dedup/` module performs article-level duplicate detection using
-in-process MinHash LSH and FAISS indexes. This document covers the **full replacement**
-of that implementation with a stateless, Weaviate-backed design, and the addition of
-cross-document entity disambiguation as a second dedup path in the same module.
+Replaces the existing `nlp/dedup/` implementation with a unified, stateless-friendly
+design and adds cross-document entity disambiguation as a second dedup path.
 
-Both paths work identically: the service receives a document or entity plus a
-pre-computed embedding, queries Weaviate, scores the candidates, and returns a decision.
-No in-process indexes. No disk state. No global variables.
+Both paths share **one API endpoint** (`POST /dedup`) parameterised by `type`. Both paths
+follow the same pattern: pre-computed embedding in → Weaviate query → scored decision out.
+
+Article dedup keeps a MinHash pre-filter (in-process, file-backed) to avoid Weaviate
+calls for cheap exact/near-exact duplicates without incurring any model cost.
 
 ---
 
 ## What changes
 
-| Component | Old | New |
-|---|---|---|
-| `minhash_index.py` | MinHash LSH in-process index | **Deleted** |
-| `embedding_index.py` | FAISS in-process index | **Deleted** |
-| `id_map.py` | row-to-article_id map | **Deleted** |
-| `persistence.py` | pickle flush/load | **Deleted** |
-| `service.py` | stateful, global `_mh/_emb/_ids`, thread lock | **Rewritten** — stateless |
-| `article_index.py` | did not exist | **New** — Weaviate-backed article dedup |
-| `entity_index.py` | did not exist | **New** — Weaviate-backed entity candidate search |
-| `disambiguator.py` | did not exist | **New** — three-tier entity decision logic |
-| `api/routers/dedup.py` | `POST /dedup` | `POST /dedup` updated + `POST /entity-disambiguate` added |
-| `api/models.py` | existing dedup models | existing unchanged + new entity disambiguation models |
+| Component | Status |
+|---|---|
+| `minhash_index.py` | **Kept** — unchanged |
+| `persistence.py` | **Simplified** — MinHash only; FAISS serialisation removed |
+| `embedding_index.py` | **Deleted** — FAISS replaced by Weaviate |
+| `id_map.py` | **Deleted** — row mapping no longer needed |
+| `service.py` | **Rewritten** — stateless entity path; article path keeps MinHash + adds Weaviate stage 2 |
+| `article_index.py` | **New** — Weaviate-backed article embedding search |
+| `entity_index.py` | **New** — Weaviate-backed entity candidate search |
+| `disambiguator.py` | **New** — three-tier entity decision logic |
+| `api/routers/dedup.py` | **Unified** — single `POST /dedup` with `type` discriminator |
+| `api/models.py` | **Updated** — discriminated-union request/response; existing article models replaced |
 
 ---
 
@@ -36,38 +36,104 @@ No in-process indexes. No disk state. No global variables.
 nlp/
   dedup/
     __init__.py
-    article_index.py    ← NEW: Weaviate-backed article near-duplicate search
+    minhash_index.py    ← unchanged
+    persistence.py      ← MinHash only (FAISS serialisation removed)
+    article_index.py    ← NEW: Weaviate-backed article embedding search
     entity_index.py     ← NEW: Weaviate-backed entity candidate search
     disambiguator.py    ← NEW: scoring + three-tier entity decision
-    service.py          ← REWRITTEN: stateless functions, no global state
+    service.py          ← rewritten: check() + entity_disambiguate(), no global FAISS state
 
 api/
   routers/
-    dedup.py            ← POST /dedup (updated) + POST /entity-disambiguate (added)
+    dedup.py            ← POST /dedup (unified)
 ```
 
 ---
 
-## Article dedup
+## Unified API
 
-### How it works
+### `POST /dedup`
 
-The caller (orchestrator or ingestion pipeline) pre-computes an embedding for the article
-text using `paraphrase-multilingual-MiniLM-L12-v2` (384-dim, same model as before) and
-sends it to `POST /dedup`. The NLP service queries the Weaviate `Articles` collection for
-vectors above the similarity threshold. If a match is found the article is a duplicate and
-is not indexed. If no match is found the article is added to Weaviate and marked as
-canonical.
+```python
+# --- Requests ---
 
-The query and the insert happen in the same service call so the caller does not need to
-make a separate write request.
+class ArticleDedupRequest(BaseModel):
+    type:       Literal["article"] = "article"
+    article_id: str
+    text:       str
+    embedding:  list[float] | None = None   # 384-dim MiniLM; computed inline if absent
+
+class EntityDedupRequest(BaseModel):
+    type:         Literal["entity"] = "entity"
+    use_case:     str
+    local_entity: LocalEntity          # from /cluster output
+    embedding:    list[float]          # 1024-dim bge-m3, caller-computed
+
+DedupRequest = Annotated[
+    ArticleDedupRequest | EntityDedupRequest,
+    Field(discriminator="type")
+]
+
+# --- Responses ---
+
+class ArticleDedupResponse(BaseModel):
+    type:         Literal["article"] = "article"
+    duplicate_of: str | None
+    score:        float | None
+    stage:        Literal["minhash", "embedding"] | None   # which stage caught the duplicate
+    indexed:      bool
+
+class EntityDedupResponse(BaseModel):
+    type:         Literal["entity"] = "entity"
+    local_id:     str
+    decision:     Literal["merge", "create", "review"]
+    canonical_id: str | None
+    confidence:   float
+    candidates:   list[CandidateResult]
+
+DedupResponse = Annotated[
+    ArticleDedupResponse | EntityDedupResponse,
+    Field(discriminator="type")
+]
+```
+
+Router:
+
+```python
+@router.post("/dedup")
+def dedup(req: DedupRequest) -> DedupResponse:
+    if req.type == "article":
+        return dedup_service.check(req)
+    return dedup_service.entity_disambiguate(req)
+```
+
+---
+
+## Article dedup (two-stage)
+
+### Stage 1 — MinHash (in-process, file-backed)
+
+Fast Jaccard check on word shingles. No model, no network call. Catches near-identical
+rewrites and reprints before any embedding is computed.
+
+The MinHash index is loaded from disk on first use and flushed to a pickle file
+periodically. The file path is `MINHASH_PATH` (env var, default
+`data/dedup_minhash.pkl`). Single-process only — not suitable for horizontal scaling,
+but appropriate for a single-pipeline deployment.
+
+Stage 1 is handled entirely by the existing `minhash_index.py` logic, unchanged.
+
+### Stage 2 — Weaviate embedding search
+
+If MinHash misses, compute a 384-dim embedding (MiniLM-L12-v2) and query Weaviate for
+the nearest article above `DEDUP_ARTICLE_THRESHOLD`. On a non-duplicate decision, add
+the article to both the MinHash index and Weaviate so future articles are checked
+against it.
 
 ### `nlp/dedup/article_index.py`
 
 ```python
 class ArticleIndex:
-    """Weaviate-backed near-duplicate index for articles."""
-
     COLLECTION = "Articles"
 
     def __init__(self, weaviate_client) -> None:
@@ -78,7 +144,7 @@ class ArticleIndex:
         embedding: list[float],
         threshold: float,
     ) -> tuple[str | None, float]:
-        """Return (article_id, score) of the nearest existing article, or (None, 0.0)."""
+        """Return (article_id, cosine_score) of nearest article, or (None, 0.0)."""
         results = (
             self._client.collections.get(self.COLLECTION)
             .query.near_vector(
@@ -92,69 +158,53 @@ class ArticleIndex:
             return None, 0.0
         obj = results.objects[0]
         score = 1.0 - obj.metadata.distance
-        if score < threshold:
-            return None, 0.0
-        return obj.properties["article_id"], score
+        return (obj.properties["article_id"], score) if score >= threshold else (None, 0.0)
 
     def add(self, article_id: str, embedding: list[float]) -> None:
-        """Insert a new canonical article embedding."""
         self._client.collections.get(self.COLLECTION).data.insert(
             properties={"article_id": article_id},
             vector=embedding,
         )
 ```
 
-The `Articles` Weaviate collection must exist before the service starts. It requires a
-single property `article_id: text` and a cosine vector index (384-dim).
-
-### `service.py` — article dedup function
+### `service.py` — article check
 
 ```python
-def check(article_id: str, embedding: list[float]) -> dict:
-    """Query Weaviate for near-duplicates; insert if none found.
+def check(req: ArticleDedupRequest) -> ArticleDedupResponse:
+    load()   # loads MinHash index from file if not already loaded
+    with _lock:
+        # Stage 1 — MinHash
+        if _ids.has(req.article_id):
+            return ArticleDedupResponse(duplicate_of=req.article_id, score=1.0,
+                                        stage="minhash", indexed=False)
+        best_aid, jaccard = _mh.query(req.text)
+        if best_aid and jaccard >= _mh.threshold:
+            return ArticleDedupResponse(duplicate_of=best_aid, score=jaccard,
+                                        stage="minhash", indexed=False)
 
-    Returns {duplicate_of, score, indexed}.
-    """
-    idx = ArticleIndex(_get_weaviate_client())
-    dup_id, score = idx.find_near_duplicate(embedding, _ARTICLE_THRESHOLD)
-    if dup_id is not None:
-        return {"duplicate_of": dup_id, "score": score, "indexed": False}
-    idx.add(article_id, embedding)
-    return {"duplicate_of": None, "score": None, "indexed": True}
-```
+        # Stage 2 — Weaviate
+        vec = req.embedding or _encode(req.text)
+        idx = ArticleIndex(_get_weaviate_client())
+        dup_id, score = idx.find_near_duplicate(vec, _ARTICLE_THRESHOLD)
+        if dup_id:
+            return ArticleDedupResponse(duplicate_of=dup_id, score=score,
+                                        stage="embedding", indexed=False)
 
-### API — `POST /dedup`
-
-The existing request model gains an `embedding` field. The `text` field is retained for
-backward compatibility but is no longer used for Stage 2 (embedding check) — the caller
-provides the vector. If `embedding` is absent the endpoint falls back to embedding the
-`text` inline (using the same MiniLM model).
-
-```python
-class DedupRequest(BaseModel):
-    article_id: str
-    text:       str
-    embedding:  list[float] | None = None   # pre-computed; if absent, computed inline
-
-class DedupResponse(BaseModel):
-    duplicate_of: str | None
-    score:        float | None
-    indexed:      bool
+        # Not a duplicate — index in both
+        _mh.add(req.article_id, req.text)
+        _ids.add(req.article_id)
+        idx.add(req.article_id, vec)
+        _maybe_flush()
+        return ArticleDedupResponse(duplicate_of=None, score=None,
+                                    stage=None, indexed=True)
 ```
 
 ---
 
-## Entity disambiguation
+## Entity disambiguation (Weaviate only)
 
-### How it works
-
-After the Clusterer produces `LocalEntity` objects (canonical within one document), the
-orchestrator computes a `bge-m3` embedding (1024-dim) for each entity (name + description)
-and sends it to `POST /entity-disambiguate`. The service queries the Weaviate
-`Entity_{use_case}_v1` collection, scores the candidates, and returns a three-tier decision.
-
-The service **does not write to Weaviate** on this path — the orchestrator decides when to
-create or merge nodes.
+No MinHash stage. Entity names are too short and diverse for Jaccard to be a useful
+pre-filter; Weaviate semantic search handles the full lookup.
 
 ### Decision logic
 
@@ -163,26 +213,17 @@ Query Weaviate for top-K candidates filtered by entity type
          │
          ▼
   Score each candidate:
-    - base score: cosine similarity from Weaviate (1.0 - distance)
-    - alias bonus: +0.15 if local entity name is in candidate.aliases (capped at 1.0)
+    + alias bonus:    +0.15 if local entity name in candidate.aliases (capped at 1.0)
     - subtype penalty: -0.05 if subtypes differ
          │
          ▼
-  best_score >= DISAMBIG_MERGE_THRESHOLD   →  "merge"   (automatic)
-  best_score in [DISAMBIG_REVIEW_LOW, DISAMBIG_MERGE_THRESHOLD)  →  LLM adjudication
-  best_score < DISAMBIG_REVIEW_LOW         →  "create"  (automatic)
+  best_score >= DISAMBIG_MERGE_THRESHOLD   →  "merge"
+  DISAMBIG_REVIEW_LOW <= best_score < DISAMBIG_MERGE_THRESHOLD  →  LLM adjudication
+  best_score < DISAMBIG_REVIEW_LOW         →  "create"
+  no candidates                            →  "create"
 
-  LLM adjudication result:
-    "yes"    → "merge"
-    "no"     → "create"
-    "unsure" → "review"
+  LLM adjudication:  "yes" → merge  |  "no" → create  |  "unsure" → review
 ```
-
-| Threshold env var | Default | Meaning |
-|---|---|---|
-| `DISAMBIG_MERGE_THRESHOLD` | `0.92` | Above → automatic merge |
-| `DISAMBIG_REVIEW_LOW` | `0.75` | Below → automatic create |
-| `DISAMBIG_TOP_K` | `10` | Weaviate candidate count |
 
 ### `nlp/dedup/entity_index.py`
 
@@ -195,56 +236,49 @@ class Candidate:
     subtype:        str | None
     description:    str
     aliases:        list[str]
-    score:          float        # cosine similarity from Weaviate
+    score:          float
 
 class EntityIndex:
-    """Weaviate-backed nearest-neighbour index for canonical entity nodes."""
-
     def __init__(self, use_case: str, weaviate_client) -> None:
-        self.use_case = use_case
         self._client = weaviate_client
-        self._collection_name = f"Entity_{use_case}_v1"
+        self._collection = f"Entity_{use_case}_v1"
 
     def find_candidates(
-        self,
-        embedding: list[float],
-        entity_type: str,
-        top_k: int = 10,
+        self, embedding: list[float], entity_type: str, top_k: int
     ) -> list[Candidate]:
         results = (
-            self._client.collections.get(self._collection_name)
+            self._client.collections.get(self._collection)
             .query.near_vector(
                 near_vector=embedding,
                 limit=top_k,
                 filters=Filter.by_property("type").equal(entity_type),
-                return_properties=["canonical_name", "type", "subtype", "description", "aliases"],
+                return_properties=["canonical_name","type","subtype","description","aliases"],
                 return_metadata=MetadataQuery(distance=True),
             )
         )
         return [
             Candidate(
-                canonical_id=str(obj.uuid),
-                canonical_name=obj.properties["canonical_name"],
-                type=obj.properties["type"],
-                subtype=obj.properties.get("subtype"),
-                description=obj.properties.get("description", ""),
-                aliases=obj.properties.get("aliases", []),
-                score=1.0 - obj.metadata.distance,
+                canonical_id=str(o.uuid),
+                canonical_name=o.properties["canonical_name"],
+                type=o.properties["type"],
+                subtype=o.properties.get("subtype"),
+                description=o.properties.get("description", ""),
+                aliases=o.properties.get("aliases", []),
+                score=1.0 - o.metadata.distance,
             )
-            for obj in results.objects
+            for o in results.objects
         ]
 ```
 
 ### `nlp/dedup/disambiguator.py`
 
-Pure logic — no Weaviate or LLM dependency (those are injected). Fully testable in
-isolation.
+Pure logic — no external dependencies. Fully testable without Weaviate or Ollama.
 
 ```python
 @dataclass
 class DisambiguationResult:
     decision:     Literal["merge", "create", "review"]
-    canonical_id: str | None    # set when decision == "merge"
+    canonical_id: str | None
     confidence:   float
     candidates:   list[Candidate]
 
@@ -257,92 +291,31 @@ def disambiguate(
     top_k:           int,
     llm_adjudicate:  bool = True,
 ) -> DisambiguationResult:
-
     candidates = entity_index.find_candidates(embedding, local_entity.type, top_k)
     if not candidates:
         return DisambiguationResult("create", None, 1.0, [])
 
-    best = _score(candidates, local_entity)
+    best = _apply_score_adjustments(candidates, local_entity)
 
     if best.score >= merge_threshold:
         return DisambiguationResult("merge", best.canonical_id, best.score, candidates)
-
     if best.score < review_low or not llm_adjudicate:
-        decision = "create" if best.score < review_low else "review"
-        return DisambiguationResult(decision, None, best.score, candidates)
-
+        return DisambiguationResult(
+            "create" if best.score < review_low else "review",
+            None, best.score, candidates,
+        )
     verdict = _llm_adjudicate(local_entity, best)
-    if verdict == "yes":
-        return DisambiguationResult("merge", best.canonical_id, best.score, candidates)
-    if verdict == "no":
-        return DisambiguationResult("create", None, best.score, candidates)
-    return DisambiguationResult("review", None, best.score, candidates)
+    decision = {"yes": "merge", "no": "create"}.get(verdict, "review")
+    canonical_id = best.canonical_id if decision == "merge" else None
+    return DisambiguationResult(decision, canonical_id, best.score, candidates)
 ```
 
-`_score` applies alias bonus (+0.15, capped at 1.0) and subtype penalty (−0.05). Returns
-the highest-scoring candidate after adjustments.
-
-`_llm_adjudicate` sends a single short prompt to Ollama asking whether two entity names
-and descriptions refer to the same real-world entity. Response schema:
-`{"verdict": "yes"|"no"|"unsure"}`. Uses `EXTRACTION_MODEL` and a 30-second timeout.
-On Ollama error returns `"unsure"` and logs WARNING (non-fatal — the decision becomes
-`"review"`).
-
-### `service.py` — entity disambiguation function
-
-```python
-def entity_disambiguate(
-    local_entity: LocalEntity,
-    embedding:    list[float],
-    use_case:     str,
-) -> dict:
-    idx = EntityIndex(use_case, _get_weaviate_client())
-    result = disambiguate(
-        local_entity=local_entity,
-        embedding=embedding,
-        entity_index=idx,
-        merge_threshold=_MERGE_THRESHOLD,
-        review_low=_REVIEW_LOW,
-        top_k=_DISAMBIG_TOP_K,
-    )
-    return {
-        "decision":     result.decision,
-        "canonical_id": result.canonical_id,
-        "confidence":   result.confidence,
-        "candidates":   [vars(c) for c in result.candidates],
-    }
-```
-
-### API — `POST /entity-disambiguate`
-
-```python
-class EntityDisambiguateRequest(BaseModel):
-    use_case:     str
-    local_entity: LocalEntity
-    embedding:    list[float]   # bge-m3 vector, 1024-dim
-
-class CandidateResult(BaseModel):
-    canonical_id:   str
-    canonical_name: str
-    type:           str
-    subtype:        str | None
-    description:    str
-    aliases:        list[str]
-    score:          float
-
-class EntityDisambiguateResponse(BaseModel):
-    local_id:     str
-    decision:     Literal["merge", "create", "review"]
-    canonical_id: str | None
-    confidence:   float
-    candidates:   list[CandidateResult]
-```
+`_llm_adjudicate` uses `EXTRACTION_MODEL` with a 30-second timeout. On Ollama error
+returns `"unsure"` (→ `"review"`) and logs WARNING.
 
 ---
 
-## Weaviate client helper
-
-Both paths share the same client factory function in `service.py`:
+## Weaviate client
 
 ```python
 def _get_weaviate_client():
@@ -357,36 +330,7 @@ def _get_weaviate_client():
     )
 ```
 
-The client is created per-request (connection pool is managed by the Weaviate SDK
-internally). No module-level client singleton.
-
----
-
-## Entity embedding
-
-Entity disambiguation requires `bge-m3` (1024-dim). The caller is responsible for
-computing the embedding via Ollama `/api/embed` before calling `/entity-disambiguate`.
-
-A thin helper `nlp/entity_encoder.py` is available for internal use and testing:
-
-```python
-def embed(texts: list[str]) -> list[list[float]]:
-    """Embed via Ollama /api/embed using bge-m3. Returns list of 1024-dim vectors."""
-    response = httpx.post(
-        f"{OLLAMA_HOST}/api/embed",
-        json={"model": ENTITY_EMBED_MODEL, "input": texts},
-        timeout=60.0,
-    )
-    response.raise_for_status()
-    return response.json()["embeddings"]
-```
-
-| Env var | Default |
-|---|---|
-| `ENTITY_EMBED_MODEL` | `bge-m3` |
-
-Article embeddings continue to use `paraphrase-multilingual-MiniLM-L12-v2` (384-dim),
-computed by the caller or inline in the `/dedup` endpoint if no `embedding` is provided.
+Created per-request; SDK manages connection pool internally.
 
 ---
 
@@ -394,30 +338,33 @@ computed by the caller or inline in the `/dedup` endpoint if no `embedding` is p
 
 | Env var | Default | Description |
 |---|---|---|
-| `DEDUP_ARTICLE_THRESHOLD` | `0.85` | Cosine similarity threshold for article duplicates |
-| `DISAMBIG_MERGE_THRESHOLD` | `0.92` | Entity: auto-merge above this |
-| `DISAMBIG_REVIEW_LOW` | `0.75` | Entity: auto-create below this |
-| `DISAMBIG_TOP_K` | `10` | Weaviate candidate count for entity search |
+| `MINHASH_PATH` | `data/dedup_minhash.pkl` | File path for MinHash index persistence |
+| `DEDUP_PERSIST_EVERY_N` | `10` | Flush MinHash to file every N indexed articles |
+| `DEDUP_ARTICLE_THRESHOLD` | `0.85` | Weaviate cosine threshold for article duplicates |
+| `DISAMBIG_MERGE_THRESHOLD` | `0.92` | Entity: auto-merge above |
+| `DISAMBIG_REVIEW_LOW` | `0.75` | Entity: auto-create below |
+| `DISAMBIG_TOP_K` | `10` | Weaviate candidate count |
 | `WEAVIATE_HOST` | `weaviate` | Weaviate hostname |
 | `WEAVIATE_PORT` | `8080` | Weaviate HTTP port |
 | `WEAVIATE_GRPC_PORT` | `50051` | Weaviate gRPC port |
-| `ENTITY_EMBED_MODEL` | `bge-m3` | Ollama model for entity embeddings |
+| `ENTITY_EMBED_MODEL` | `bge-m3` | Ollama model for entity embeddings (caller-side) |
 
 ---
 
 ## Testing
 
-See [06-testing.md](06-testing.md) §3 — `disambiguator.py` is pure logic with no
-Weaviate or Ollama calls; candidates are passed in directly. `article_index.py` and
-`entity_index.py` are tested with an injected mock Weaviate client. Key cases: automatic
-merge, automatic create, LLM adjudication (each verdict), alias bonus, subtype penalty,
-empty candidate list, Weaviate unavailable.
+See [06-testing.md](06-testing.md) §3.
+- `disambiguator.py` is pure logic; candidates are injected — no Weaviate or Ollama needed.
+- `article_index.py` and `entity_index.py` use an injected mock Weaviate client.
+- `service.check()` is tested with mocked MinHash + mocked Weaviate: MinHash hit, Weaviate
+  hit, full miss (indexed), Weaviate unavailable (503 propagated).
+- Key entity cases: auto-merge, auto-create, each LLM verdict, alias bonus, subtype
+  penalty, empty candidate list.
 
 ---
 
 ## Dependencies
 
-- `weaviate-client>=4.0` — **new package** (replaces `faiss-cpu` which is removed)
-- `httpx` — already in requirements.txt
+- `weaviate-client>=4.0` — new package
 - `sentence-transformers` — kept for inline article embedding fallback
-- `faiss-cpu` — **removed**
+- `faiss-cpu` — **removed** from requirements.txt

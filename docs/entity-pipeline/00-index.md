@@ -71,13 +71,30 @@ Article Dedup   POST /dedup
   pronouns and role titles against the named entities already found in the same document.
   Step is skipped entirely if no unresolved mentions are detected.
 
-- **Stateless dedup.** Both article dedup and entity disambiguation query Weaviate
-  per-request. No in-process MinHash, FAISS, or global indexes. `minhash_index.py`,
-  `embedding_index.py`, `id_map.py`, and `persistence.py` are removed.
+- **`[PRONOUN]` token for unresolved pronouns.** If the extractor finds a pronoun or bare
+  role title with no named antecedent in the same chunk, it uses `[PRONOUN]` as the entity
+  name (confidence 0.3) and preserves the relation and its span. The clusterer resolves
+  these against the full document's named entity list in the same combined LLM call.
 
-- **Same dedup pattern for articles and entities.** Caller sends a pre-computed embedding;
-  service queries Weaviate; returns a decision. Thresholds are env-var-configured in the
-  service, not in the caller.
+- **Jaccard name hints in clusterer prompt.** Before the LLM call, word-token Jaccard is
+  computed for all mention pairs. Pairs ≥ 0.5 are annotated `LIKELY_SAME` in the prompt;
+  `[PRONOUN]` mentions are annotated `NEEDS_RESOLUTION`. No rule-based resolution — the LLM
+  makes all decisions using these annotations as hints.
 
-- **One backward-compatible signature change** to `ollama_client.generate()` unlocks entity
-  description maintenance without touching any existing caller.
+- **Combined clustering + edge wiring in one LLM call.** The clusterer prompt includes both
+  the flat entity mention list and the flat relation list. The LLM returns clusters with
+  `mention_indices` AND edges with `head_local_id` / `tail_local_id` assigned in the same
+  output. No second rule-based pass.
+
+- **MinHash kept; FAISS removed.** Article dedup: Stage 1 MinHash (in-process, file-backed
+  pickle, `MINHASH_PATH`) catches exact/near-exact reprints cheaply. Stage 2 Weaviate
+  handles semantic duplicates. `embedding_index.py` and `id_map.py` deleted; `faiss-cpu`
+  removed. Entity disambiguation uses Weaviate only (names too short for Jaccard pre-filter).
+
+- **Unified `POST /dedup`.** Article dedup and entity disambiguation share one endpoint,
+  dispatched by a `type` discriminator (`"article"` | `"entity"`). Same pattern: caller
+  sends pre-computed embedding, service queries Weaviate, returns decision.
+
+- **Unified `POST /summarize`.** Article rewriting and entity description share one
+  endpoint, dispatched by `type` (`"article"` | `"entity"`). Prompts live in the service.
+  Extensible to `"relation"` by adding a model, a prompt, and a service function.
