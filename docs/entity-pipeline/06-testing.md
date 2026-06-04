@@ -79,13 +79,14 @@ tests/fixtures/schemas/
 ### Key test cases
 
 ```python
-def test_entity_type_names_includes_novel():
+def test_entity_type_names_match_yaml():
     s = load_schema("valid_financial_flows.yaml")
-    assert "__NOVEL__" in s.entity_type_names()
+    assert set(s.entity_type_names()) == {"PERSON", "ORGANIZATION", "FINANCIAL_ENTITY", "LOCATION", "EVENT"}
 
-def test_relation_type_names_includes_unclassified():
+def test_relation_type_names_match_yaml():
     s = load_schema("valid_financial_flows.yaml")
-    assert "__UNCLASSIFIED__" in s.relation_type_names()
+    assert "PAYMENT_TO" in s.relation_type_names()
+    assert "OWNS" in s.relation_type_names()
 
 def test_required_entity_attrs():
     s = load_schema("valid_financial_flows.yaml")

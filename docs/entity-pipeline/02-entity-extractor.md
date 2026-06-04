@@ -82,7 +82,7 @@ class EntityAttributes(BaseModel):
 
 class ExtractedEntity(BaseModel):
     name:        str
-    type:        str            # validated against schema enum (includes __NOVEL__)
+    type:        str            # validated against schema enum (closed set)
     subtype:     str | None
     description: str
     span:        ExtractedSpan
@@ -203,9 +203,7 @@ RULES
   missing a required attribute lowers your confidence score for that entity or relation.
 - Spans are CHARACTER OFFSETS relative to the start of the chunk (first character = 0).
 - A relation's head and tail must be entity names you have already listed.
-- If an entity type does not fit any listed type, use __NOVEL__.
-- If a relation type does not fit any listed type, use __UNCLASSIFIED__ and preserve the
-  original phrase in the description field.
+- Use only the entity and relation types listed above — the schema is fixed.
 - Extract all entity mentions including pronouns and aliases — the resolver will cluster them.
 ```
 

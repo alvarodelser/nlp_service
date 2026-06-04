@@ -5,18 +5,34 @@
 Single source of truth for a use-case's entity types, relation types, their extractable
 attributes, and visual encoding hints. Every module that touches the extraction pipeline
 imports the schema rather than hardcoding types. The loader validates the YAML at startup,
-then emits derived artefacts on demand:
+then emits three derived artefacts on demand — all by **mechanical rule, no intelligence
+required**:
 
-- A **JSON Schema** consumed by Ollama's constrained decoding (`format=`) in Pass 1
-- A **system prompt section** listing per-type attribute requirements for the LLM
-- A **Weaviate collection spec** consumed by persistence when creating or migrating a collection
+| Artefact | Consumer | How it is derived |
+|---|---|---|
+| **JSON Schema** (`format=`) | Ollama constrained decoding in Pass 1 | Entity type names → enum; all attribute keys across all types → nullable properties union |
+| **System prompt section** | LLM extraction prompt | Type descriptions + per-type attribute requirements table, templated from YAML fields |
+| **Weaviate collection spec** | Persistence on first run / migration | Entity type names + attribute keys → Weaviate property definitions |
 
 One process may load multiple schemas (one per active use case).
 
-The schema is **open-world**: the LLM is guided toward known types but is never forced to
-misclassify. Unknown entity types are extracted as `__NOVEL__`; unknown relation types as
-`__UNCLASSIFIED__`. Both accumulate in a review queue and become candidates for schema
-expansion.
+### Phase 0 — closed, predetermined schema
+
+In Phase 0 the schema is fixed before any documents are processed. The entity and relation
+type sets are decided by the analyst, written to YAML, and treated as a closed world: the
+LLM extracts only from those types, and there are no escape hatches (`__NOVEL__`,
+`__UNCLASSIFIED__` are not used).
+
+### Future phases
+
+- **Phase 1 — schema editor UI**: the YAML-backed schema is exposed in a UI where the
+  analyst can add or edit types, attributes, and visual hints without touching files. Changes
+  version-bump the schema and trigger a Weaviate collection migration.
+
+- **Phase 2 — semi-supervised schema generation**: an agent reads a sample of the corpus,
+  proposes a candidate schema (entity types, relations, attributes it observes), and presents
+  it for analyst review and approval. Once approved the schema is locked and passed to Phase 0
+  processing. The agent proposes; the human decides.
 
 ---
 
@@ -175,15 +191,6 @@ entity_types:
         required: false
         description: "Classification: meeting, transaction, filing, ruling, other."
 
-  - name: __NOVEL__
-    description: >
-      Entity that does not fit any defined type. Use only when genuinely
-      no other type applies. The schema team will review and potentially
-      promote to a named type.
-    visual: {color: "#BDC3C7", border: dashed}
-    subtypes: []
-    attributes: {}
-
 relation_types:
   - name: PAYMENT_TO
     description: >
@@ -291,22 +298,13 @@ relation_types:
         required: false
         description: "plaintiff | defendant | signatory | witness | other"
 
-  - name: __UNCLASSIFIED__
-    description: >
-      Relation that does not fit any defined type. Preserve the surface
-      phrase in `description`. The schema team will review and potentially
-      promote to a named type.
-    head_types: []   # unconstrained
-    tail_types: []
-    visual: {color: "#BDC3C7", line: dashed}
-    attributes: {}
 ```
 
 ### Validation rules (enforced at load time)
 
 | Rule | Check |
 |---|---|
-| `name` is SCREAMING_SNAKE_CASE (or `__NOVEL__` / `__UNCLASSIFIED__`) | regex |
+| `name` is SCREAMING_SNAKE_CASE | regex |
 | All `head_types` / `tail_types` values are declared entity type names | set membership |
 | Each `attributes` entry has `type` in `{string, number, boolean}` | enum |
 | Each `attributes` entry has `required` as a boolean | type check |
@@ -361,7 +359,7 @@ schema.weaviate_collection_spec()  # -> dict  (Weaviate collection definition)
         "additionalProperties": false,
         "properties": {
           "name":        {"type": "string"},
-          "type":        {"enum": ["PERSON", "ORGANIZATION", ..., "__NOVEL__"]},
+          "type":        {"enum": ["PERSON", "ORGANIZATION", ...]},  // closed — only schema-defined types
           "subtype":     {"oneOf": [{"enum": ["POLITICIAN", ...]}, {"type": "null"}]},
           "description": {"type": "string"},
           "span":        {
@@ -404,7 +402,7 @@ schema.weaviate_collection_spec()  # -> dict  (Weaviate collection definition)
         "additionalProperties": false,
         "properties": {
           "head":          {"type": "string"},
-          "relation":      {"enum": ["PAYMENT_TO", "OWNS", ..., "__UNCLASSIFIED__"]},
+          "relation":      {"enum": ["PAYMENT_TO", "OWNS", ...]},  // closed — only schema-defined types
           "tail":          {"type": "string"},
           "description":   {"type": "string"},
           "evidence_span": {
