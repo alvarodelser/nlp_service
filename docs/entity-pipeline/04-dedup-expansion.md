@@ -113,14 +113,30 @@ def dedup(req: DedupRequest) -> DedupResponse:
 
 ### Stage 1 — MinHash (in-process, file-backed)
 
-Fast Jaccard check on word shingles. No model, no network call. Catches near-identical
-rewrites and reprints before any embedding is computed.
+MinHash is a fast approximate Jaccard similarity check on word shingles. It requires no
+neural model and no network call — just hashing. The implementation (`minhash_index.py`,
+unchanged) uses **128 hash permutations** and **3-word shingles**, with a default threshold
+of 0.9 Jaccard similarity. Any two articles with ≥ 90% overlapping 3-gram vocabulary are
+treated as near-duplicates without ever touching Weaviate.
 
-The MinHash index is loaded from disk on first use and flushed to a pickle file
-periodically. The file path is `MINHASH_PATH` (env var, default
-`data/dedup_minhash.pkl`). Single-process only — not suitable for horizontal scaling,
-but appropriate for a single-pipeline deployment.
+**Where it lives:** The `MinHashLSH` object and its per-article MinHash signatures live in
+the NLP service process memory (the global `_mh` in `service.py`). They are loaded from a
+pickle file at startup and flushed back to disk every `DEDUP_PERSIST_EVERY_N` articles. The
+file path is `DEDUP_DATA_DIR/minhash_lsh.pkl` (default `/data/dedup/`). This path **must
+be a Docker volume mount** — if it is not, the index resets to empty on every container
+restart and MinHash provides no benefit until it is rebuilt by processing real traffic.
 
+**Size:** Each article contributes one MinHash signature (128 × 4 bytes = 512 bytes) stored
+in `_signatures`, plus entries in the LSH band tables (datasketch creates ≈ 25 bands for
+threshold 0.9, each band a hash-table lookup entry). Total cost is roughly **3–5 KB per
+article**. At 100K articles: ~300–500 MB RAM and a similar-sized pickle on disk. This is
+fine for a single-process deployment. If you need to scale horizontally across multiple
+replicas, each replica has independent state — the MinHash index does not synchronise.
+For a single ingestion pipeline (one process ingesting articles sequentially) this is
+not a problem.
+
+**What is passed:** The article `text` must be sent to the service because MinHash operates
+on word shingles of the raw text — the computation cannot be pre-delegated to the caller.
 Stage 1 is handled entirely by the existing `minhash_index.py` logic, unchanged.
 
 ### Stage 2 — Weaviate embedding search

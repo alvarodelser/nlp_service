@@ -444,17 +444,34 @@ to know what keys to expect and coerce to the right Python types.
   "description": "Canonical entities for use case financial_flows, schema v1",
   "vectorizer_config": [{"vectorizer": {"none": {}}}],
   "properties": [
-    {"name": "canonical_name", "dataType": ["text"]},
-    {"name": "type",           "dataType": ["text"]},
-    {"name": "subtype",        "dataType": ["text"]},
-    {"name": "description",    "dataType": ["text"]},
-    {"name": "aliases",        "dataType": ["text[]"]},
-    {"name": "doc_ids",        "dataType": ["text[]"]},
-    {"name": "schema_version", "dataType": ["text"]}
+    {"name": "canonical_name",    "dataType": ["text"]},
+    {"name": "type",              "dataType": ["text"]},
+    {"name": "subtype",           "dataType": ["text"]},
+    {"name": "description",       "dataType": ["text"]},
+    {"name": "aliases",           "dataType": ["text[]"]},
+    {"name": "doc_ids",           "dataType": ["text[]"]},
+    {"name": "evidence_windows",  "dataType": ["text[]"]},   // text windows for description refresh
+    {"name": "schema_version",    "dataType": ["text"]}
   ],
   "vectorIndexConfig": {"distance": "cosine"}
 }
 ```
+
+`evidence_windows` stores the pre-formatted text windows accumulated from every document
+mention of this entity. Each item is a string of the form:
+
+```
+[doc_id: abc123, 2024-03-15] "Sentence before mention. The entity mention sentence. Sentence after."
+```
+
+The persistence module appends a new window on every merge or create. The caller reads
+this array from Weaviate and passes it as `evidence` to `POST /summarize` with
+`type: "entity"`. The NLP service itself never writes to or reads from Weaviate — it
+only receives the evidence as input and returns a description.
+
+A separate `Edge_{use_case}_v1` collection mirrors this structure for canonical relation
+edges, carrying `head_canonical_id`, `relation`, `tail_canonical_id`, `description`,
+`evidence_windows`, and `doc_ids`.
 
 The collection name embeds the use case and schema version so incompatible schemas never
 share a collection. Migrations create a new collection, backfill, then reroute writes.

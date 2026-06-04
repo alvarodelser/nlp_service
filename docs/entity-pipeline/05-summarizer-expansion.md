@@ -1,14 +1,51 @@
 # Summarizer Module — Unified Endpoint
 
-## Purpose of this document
+## Purpose
 
-Refactors the existing `nlp/summarizer/` module to expose a **single unified
-`POST /summarize` endpoint** parameterised by `type`. Article rewriting, entity
-description generation, and any future summary type (relations, edges, clusters) all
-route through the same endpoint. Prompts live in the service.
+Refactors `nlp/summarizer/` so that article rewriting, entity description generation,
+and relation description generation all go through a single `POST /summarize` endpoint
+parameterised by `type`. Prompts live in the service; the caller only supplies the content
+and evidence.
 
-The existing article summarisation logic is **not changed in behaviour**. Only the
-API surface and service dispatch are unified.
+The existing article rewriting logic is not changed in behaviour. Only the API surface and
+service dispatch are unified.
+
+---
+
+## The GraphRAG evidence pattern
+
+Entity and relation descriptions in the knowledge graph are not static. Each time a
+canonical entity is updated (a new document merges a mention into it), the description
+should be refreshed to incorporate the new evidence. This is the GraphRAG pattern:
+accumulate text windows, regenerate the description from all of them.
+
+**Text window** — the sentence(s) surrounding an entity or relation mention in a chunk.
+The clusterer already has the raw material:
+
+```
+LocalEntity.mentions[i].char_start / char_end   ← span inside the chunk
+ChunkExtraction.text                             ← full chunk text
+```
+
+Extracting ±2 sentences around the span from the chunk text gives the evidence window.
+For relations, `LocalEdge.evidence.text` already is the extracted evidence sentence.
+
+**Storage (persistence module's responsibility, not the NLP service):**
+The Weaviate entity and edge nodes each carry an `evidence_windows: text[]` property
+(see `01-ontology.md` — Weaviate collection spec). After a successful merge or create,
+the persistence module appends the new window(s) to that property. Before calling
+`POST /summarize`, the caller reads `evidence_windows` from Weaviate and passes them
+as the `evidence` list.
+
+**Recommended evidence string format:**
+
+```
+[doc_id: abc123, 2024-03-15] "Acme Holdings, a Delaware-registered shell company,
+received €4.2M from the minister's personal account via a Maltese correspondent bank."
+```
+
+The service does not enforce format — it is injected verbatim into the prompt. Using
+doc_id and date helps the LLM situate the evidence in time but is optional.
 
 ---
 
@@ -18,42 +55,54 @@ API surface and service dispatch are unified.
 |---|---|
 | `ollama_client.py` — `generate()` | One new optional `schema` parameter (default = article schema). No existing caller changes. |
 | `service.py` — `run()` | Unchanged |
-| `service.py` — `describe_entity()` | **New function** appended |
+| `service.py` — `describe_entity()` | **New** |
+| `service.py` — `describe_relation()` | **New** |
 | `prompts/rewrite.es.txt` | Unchanged |
 | `prompts/entity_describe.txt` | **New** |
+| `prompts/relation_describe.txt` | **New** |
 | `validator.py` | Unchanged |
-| `api/routers/summarize.py` — `POST /summarize` | **Unified** — replaces both old `/summarize` and new `/summarize/entity` |
-| `api/models.py` | **Unified** request/response models (discriminated union) |
+| `api/routers/summarize.py` — `POST /summarize` | **Unified** — replaces both old `/summarize` and the separate `/summarize/entity` |
+| `api/models.py` | **Unified** discriminated-union request/response |
 
 ---
 
-## Unified API
+## Unified API — `POST /summarize`
 
-### `POST /summarize`
+### Request models
 
 ```python
-# --- Requests ---
-
 class ArticleSummarizeRequest(BaseModel):
-    type:    Literal["article"] = "article"
-    text:    str           # article body to rewrite
-    lang:    str = "es"   # target language for rewrite prompt
+    type: Literal["article"] = "article"
+    text: str           # article body to rewrite
+    lang: str = "es"    # target language for rewrite prompt
 
 class EntityDescribeRequest(BaseModel):
     type:         Literal["entity"] = "entity"
-    canonical_id: str             # graph node being updated
+    canonical_id: str             # graph node being updated (echoed in response)
     name:         str
     entity_type:  str
     subtype:      str | None = None
-    evidence:     list[str]       # pre-formatted context strings, 1–50 items
+    evidence:     list[str]       # pre-formatted text windows, 1–50 items
+
+class RelationDescribeRequest(BaseModel):
+    type:         Literal["relation"] = "relation"
+    canonical_id: str             # canonical edge ID (echoed in response)
+    head_name:    str
+    head_type:    str
+    relation:     str             # relation type name from schema (e.g. "PAYMENT_TO")
+    tail_name:    str
+    tail_type:    str
+    evidence:     list[str]       # pre-formatted text windows, 1–50 items
 
 SummarizeRequest = Annotated[
-    ArticleSummarizeRequest | EntityDescribeRequest,
+    ArticleSummarizeRequest | EntityDescribeRequest | RelationDescribeRequest,
     Field(discriminator="type")
 ]
+```
 
-# --- Responses ---
+### Response models
 
+```python
 class ArticleSummarizeResponse(BaseModel):
     type:     Literal["article"] = "article"
     headline: str
@@ -64,13 +113,18 @@ class EntityDescribeResponse(BaseModel):
     canonical_id: str
     description:  str
 
+class RelationDescribeResponse(BaseModel):
+    type:         Literal["relation"] = "relation"
+    canonical_id: str
+    description:  str
+
 SummarizeResponse = Annotated[
-    ArticleSummarizeResponse | EntityDescribeResponse,
+    ArticleSummarizeResponse | EntityDescribeResponse | RelationDescribeResponse,
     Field(discriminator="type")
 ]
 ```
 
-Router:
+### Router
 
 ```python
 @router.post("/summarize")
@@ -81,34 +135,30 @@ def summarize(req: SummarizeRequest) -> SummarizeResponse:
         result = summarizer_service.run(req.text, req.lang)
         return ArticleSummarizeResponse(**result)
 
-    if req.type == "entity":
+    if req.type in ("entity", "relation"):
         if not req.evidence:
             raise HTTPException(422, "evidence must be non-empty")
         try:
-            result = summarizer_service.describe_entity(
-                name=req.name,
-                entity_type=req.entity_type,
-                subtype=req.subtype,
-                evidence=req.evidence,
-            )
+            if req.type == "entity":
+                result = summarizer_service.describe_entity(req)
+                return EntityDescribeResponse(canonical_id=req.canonical_id, **result)
+            else:
+                result = summarizer_service.describe_relation(req)
+                return RelationDescribeResponse(canonical_id=req.canonical_id, **result)
         except httpx.HTTPError as exc:
             log.error("ollama unavailable: %s", exc)
             raise HTTPException(503, "ollama_unavailable")
         except (KeyError, ValueError) as exc:
             log.error("ollama json format failed: %s", exc)
             raise HTTPException(503, "ollama_json_format_failed")
-        return EntityDescribeResponse(canonical_id=req.canonical_id, **result)
 ```
-
-The old `POST /summarize/entity` is removed. Callers migrate to `POST /summarize` with
-`"type": "entity"`.
 
 ---
 
-## Changes to `ollama_client.py`
+## Change to `ollama_client.py`
 
-Add one optional parameter with a default that preserves the current article schema.
-Existing callers need no changes.
+One new optional parameter, default preserves current article schema so no existing
+caller changes:
 
 ```python
 _ARTICLE_SCHEMA: dict = {
@@ -118,6 +168,12 @@ _ARTICLE_SCHEMA: dict = {
         "summary":  {"type": "string"},
     },
     "required": ["headline", "summary"],
+}
+
+_DESCRIBE_SCHEMA: dict = {
+    "type": "object",
+    "properties": {"description": {"type": "string"}},
+    "required": ["description"],
 }
 
 def generate(
@@ -131,50 +187,29 @@ def generate(
 
 ---
 
-## New function `service.describe_entity()`
+## New service functions
 
-Appended to the bottom of `nlp/summarizer/service.py`. The existing `run()` is untouched.
+Both are appended to the bottom of `service.py`. Existing `run()` is not touched.
 
-```python
-_ENTITY_DESCRIBE_SCHEMA: dict = {
-    "type": "object",
-    "properties": {"description": {"type": "string"}},
-    "required": ["description"],
-}
+### `describe_entity(req: EntityDescribeRequest) -> dict`
 
-_ENTITY_DESCRIBE_PROMPT_PATH = Path(__file__).parent / "prompts" / "entity_describe.txt"
-_ENTITY_DESCRIBE_TEMPLATE: str | None = None
+Builds a prompt from the `entity_describe.txt` template and calls
+`ollama_client.generate(prompt, schema=_DESCRIBE_SCHEMA)`.
 
-def _load_entity_describe_template() -> str:
-    global _ENTITY_DESCRIBE_TEMPLATE
-    if _ENTITY_DESCRIBE_TEMPLATE is None:
-        _ENTITY_DESCRIBE_TEMPLATE = _ENTITY_DESCRIBE_PROMPT_PATH.read_text(encoding="utf-8")
-    return _ENTITY_DESCRIBE_TEMPLATE
+### `describe_relation(req: RelationDescribeRequest) -> dict`
 
+Builds a prompt from the `relation_describe.txt` template and calls
+`ollama_client.generate(prompt, schema=_DESCRIBE_SCHEMA)`.
 
-def describe_entity(
-    name:        str,
-    entity_type: str,
-    subtype:     str | None,
-    evidence:    list[str],
-) -> dict:
-    """Returns {'description': str}."""
-    template = _load_entity_describe_template()
-    subtype_line = f"Subtype: {subtype}" if subtype else ""
-    evidence_list = "\n".join(f"{i+1}. {e}" for i, e in enumerate(evidence))
-    prompt = template.format(
-        name=name,
-        entity_type=entity_type,
-        subtype_line=subtype_line,
-        evidence_list=evidence_list,
-    )
-    result = ollama_client.generate(prompt, schema=_ENTITY_DESCRIBE_SCHEMA)
-    return {"description": result["description"]}
-```
+Neither function applies the article validator (length constraints do not apply to
+graph descriptions). If the LLM returns malformed JSON after retries, `generate()`
+raises `ValueError` — the router returns 503.
 
 ---
 
-## New prompt template (`prompts/entity_describe.txt`)
+## Prompt templates
+
+### `prompts/entity_describe.txt`
 
 ```
 You are maintaining a knowledge graph for investigative journalism.
@@ -194,27 +229,48 @@ RULES
 =====
 - Write 2–4 sentences maximum.
 - State only what the evidence explicitly supports.
-- Include key relationships, roles, and any confirmed financial or legal facts.
-- Do not speculate or add information not present in the evidence.
-- Write in English regardless of the evidence language.
+- Include key roles, relationships, and any confirmed financial or legal facts.
+- Do not speculate or add information not in the evidence.
+- Write in English regardless of the source language.
 ```
 
-Evidence items are pre-formatted by the caller:
+`{subtype_line}` is `Subtype: {subtype}` if present, otherwise omitted.
+`{evidence_list}` is a numbered list, one item per evidence string.
+
+### `prompts/relation_describe.txt`
 
 ```
-[doc_id: abc123, 2024-03-15] "Acme Holdings, a Delaware-registered shell company,
-   received €4.2M from the minister's personal account..."
+You are maintaining a knowledge graph for investigative journalism.
+Write a concise, factual description of the relationship below based on the evidence provided.
+
+RELATIONSHIP
+============
+From: {head_name} ({head_type})
+Relation: {relation}
+To:   {tail_name} ({tail_type})
+
+ACCUMULATED EVIDENCE
+====================
+{evidence_list}
+
+RULES
+=====
+- Write 2–4 sentences maximum.
+- State only what the evidence explicitly supports.
+- Include amounts, dates, currencies, and mechanisms (wire, cash, crypto) where stated.
+- Do not speculate or add information not in the evidence.
+- Write in English regardless of the source language.
 ```
 
 ---
 
-## Triggering
+## When each type is triggered
 
-`POST /summarize` with `type: "entity"` is called by the persistence module (out of scope)
-in two situations:
-
-1. A `"merge"` decision from the disambiguator → re-describe with all accumulated evidence.
-2. A new canonical node is created → generate its initial description.
+| Type | Triggered by |
+|---|---|
+| `"article"` | Ingestion pipeline after chunking |
+| `"entity"` | Persistence module after a merge into an existing canonical node, or on creation of a new node with multiple supporting chunks |
+| `"relation"` | Persistence module after a canonical edge receives a new evidence window (same trigger as entity, but on the edge) |
 
 The NLP service has no knowledge of when to trigger — it only responds to calls.
 
@@ -222,31 +278,33 @@ The NLP service has no knowledge of when to trigger — it only responds to call
 
 ## Extending to new types
 
-To add a `"relation"` or `"edge"` summary type:
+To add a future type (e.g. `"cluster_summary"` or `"timeline"`):
 
-1. Add a new `RelationDescribeRequest` / `RelationDescribeResponse` Pydantic model.
+1. Add a new `XxxRequest` / `XxxResponse` Pydantic model with `type: Literal["xxx"]`.
 2. Extend the `SummarizeRequest` / `SummarizeResponse` union.
 3. Add a new prompt template under `prompts/`.
-4. Add a new service function analogous to `describe_entity()`.
-5. Add a branch in the router.
+4. Add a new `describe_xxx()` service function.
+5. Add one branch in the router.
 
-No existing code paths change.
+Nothing else changes.
 
 ---
 
 ## Configuration
 
 No new environment variables. Uses the same `OLLAMA_MODEL` and `OLLAMA_TIMEOUT` as
-article summarisation. Add `ENTITY_DESCRIBE_MODEL` to override for entity descriptions
-only if needed.
+article summarisation.
 
 ---
 
 ## Testing
 
-See [06-testing.md](06-testing.md) §5 — mock Ollama via `httpx.post`. Verify that
-`describe_entity()` passes `_ENTITY_DESCRIBE_SCHEMA` (not `_ARTICLE_SCHEMA`) to
-`generate()`. Verify router dispatches correctly on `type` discriminator.
+See [06-testing.md](06-testing.md) §5. Mock Ollama via `httpx.post`. Key cases:
+- `describe_entity()` passes `_DESCRIBE_SCHEMA`, not `_ARTICLE_SCHEMA`
+- `describe_relation()` passes `_DESCRIBE_SCHEMA`
+- Router dispatches correctly on `type` discriminator
+- Empty `evidence` → 422
+- Ollama unavailable → 503 on entity and relation paths
 
 ---
 
