@@ -15,10 +15,10 @@ Entity Extractor  [Pass 1, per chunk]   POST /entity-extract
 Intra-Doc Clusterer  [per document]     POST /cluster
     │  LocalEntity[], LocalEdge[] with local_ids and absolute offsets
     ▼
-Entity Disambiguator  [per LocalEntity]  POST /entity-disambiguate
+Entity Disambiguator  [per LocalEntity]  POST /dedup  (type: "entity")
     │  decision: merge | create | review
     ▼
-Summarizer /entity    [on merge or create]  POST /summarize/entity
+Summarizer            [on merge or create]  POST /summarize  (type: "entity" | "relation")
     │  refreshed canonical description
     ▼
 Persistence (out of scope)
@@ -28,9 +28,9 @@ Article dedup runs in parallel at ingestion time:
 
 ```
 Chunker
-    │  article_id + pre-computed embedding
+    │  article_id + text + optional embedding
     ▼
-Article Dedup   POST /dedup
+Article Dedup   POST /dedup  (type: "article")
     │  duplicate_of | indexed
     ▼
 (continue pipeline or discard)
@@ -67,14 +67,11 @@ Article Dedup   POST /dedup
 - **No edge merging.** Multiple edges between the same entity pair are valid distinct
   events. No amount summing, no attribute merging, no deduplication of relations.
 
-- **Pronoun and role resolution in the clusterer.** A second constrained LLM call resolves
-  pronouns and role titles against the named entities already found in the same document.
-  Step is skipped entirely if no unresolved mentions are detected.
-
 - **`[PRONOUN]` token for unresolved pronouns.** If the extractor finds a pronoun or bare
   role title with no named antecedent in the same chunk, it uses `[PRONOUN]` as the entity
   name (confidence 0.3) and preserves the relation and its span. The clusterer resolves
-  these against the full document's named entity list in the same combined LLM call.
+  these against the full document's named entity list in the same combined LLM call —
+  `[PRONOUN]` mentions are annotated `NEEDS_RESOLUTION` in the prompt.
 
 - **Jaccard name hints in clusterer prompt.** Before the LLM call, word-token Jaccard is
   computed for all mention pairs. Pairs ≥ 0.5 are annotated `LIKELY_SAME` in the prompt;
@@ -87,14 +84,15 @@ Article Dedup   POST /dedup
   output. No second rule-based pass.
 
 - **MinHash kept; FAISS removed.** Article dedup: Stage 1 MinHash (in-process, file-backed
-  pickle, `MINHASH_PATH`) catches exact/near-exact reprints cheaply. Stage 2 Weaviate
-  handles semantic duplicates. `embedding_index.py` and `id_map.py` deleted; `faiss-cpu`
-  removed. Entity disambiguation uses Weaviate only (names too short for Jaccard pre-filter).
+  pickle at `DEDUP_DATA_DIR/{use_case}/minhash_lsh.pkl`) catches exact/near-exact reprints
+  cheaply. Stage 2 Weaviate handles semantic duplicates. `embedding_index.py` and `id_map.py`
+  deleted; `faiss-cpu` removed. Entity disambiguation uses Weaviate only.
 
 - **Unified `POST /dedup`.** Article dedup and entity disambiguation share one endpoint,
   dispatched by a `type` discriminator (`"article"` | `"entity"`). Same pattern: caller
   sends pre-computed embedding, service queries Weaviate, returns decision.
 
-- **Unified `POST /summarize`.** Article rewriting and entity description share one
-  endpoint, dispatched by `type` (`"article"` | `"entity"`). Prompts live in the service.
-  Extensible to `"relation"` by adding a model, a prompt, and a service function.
+- **Unified `POST /summarize`.** Article rewriting, entity description, and relation
+  description share one endpoint, dispatched by `type` (`"article"` | `"entity"` |
+  `"relation"`). Prompts live in the service. Extensible to further types without changing
+  existing paths.

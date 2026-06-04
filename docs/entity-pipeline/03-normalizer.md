@@ -29,7 +29,7 @@ Entity Disambiguator  (per LocalEntity)
 | Does | Does not |
 |---|---|
 | Cluster surface mentions to a `local_id` + canonical name | Deduplicate edges between the same pair |
-| Resolve `[PRONOUN]` / `[PRONOUN]` markers to named entities | Merge or sum relation attributes |
+| Resolve `[PRONOUN]` markers to named entities | Merge or sum relation attributes |
 | Assign `head_local_id` / `tail_local_id` to every edge (LLM) | Contact any external index or store |
 | Compute absolute char offsets for every mention | Make any cross-document decisions |
 
