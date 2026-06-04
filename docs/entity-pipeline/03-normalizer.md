@@ -1,33 +1,43 @@
-# Normalizer — Design & Implementation
+# Intra-Document Entity Clustering — Design & Implementation
 
 ## Purpose
 
-Pass 2 of the document-level extraction pipeline. Operates once per document after all
-chunks have been extracted. It performs two operations in a single LLM call:
+After all chunks of a document have been processed by the Entity Extractor, this step
+clusters entity mentions that refer to the same real-world entity within the document and
+resolves pronouns and role references to the named entities already found.
 
-1. **Intra-document entity resolution** — cluster all entity mentions from all chunks into
-   canonical local entities (`local_id`). "Musk", "Elon Musk", and "the billionaire" become
-   one cluster with canonical name "Elon Musk".
-
-2. **Edge deduplication** — when multiple chunks independently extract the same
-   `(head, relation_type, tail)` triple, merge them into a single edge, accumulating all
-   evidence spans and merging attributes (sum amounts, union dates).
-
-Relation type normalization is **not** a task of this module — canonical relation types are
-already assigned in Pass 1 via enum-constrained decoding. This module works with those
-canonical types from the start.
-
-After this module, relation endpoints are `local_id`s, not surface name strings. Cross-document
-disambiguation (mapping `local_id → canonical_id` in the graph) is a separate downstream step.
+The output is a flat list of `LocalEntity` objects — one per canonical entity within the
+document — each carrying its surface mentions, absolute offsets, and a provisional
+description. These become the inputs to cross-document disambiguation.
 
 ---
 
 ## Position in pipeline
 
 ```
-Chunker  →  Entity Extractor (×N chunks)  →  [Normalizer]  →  Disambiguator  →  Persistence
-                                               (per doc, Pass 2)
+Entity Extractor (×N chunks)
+    │  entities[], relations[] per chunk
+    ▼
+[Intra-Document Entity Clustering]   POST /cluster
+    │  LocalEntity[], edges[]
+    ▼
+Entity Disambiguator  (per LocalEntity)
 ```
+
+---
+
+## What this step does and does not do
+
+| Does | Does not |
+|---|---|
+| Cluster surface mentions to a canonical name + `local_id` | Deduplicate edges between the same pair |
+| Resolve pronouns and roles ("the CEO", "he") to named entities | Merge or sum relation attributes |
+| Resolve relation endpoints from surface strings to `local_id`s | Contact any external index or store |
+| Produce absolute character offsets for every mention | Make any cross-document decisions |
+
+Multiple edges between the same `(head_local_id, relation, tail_local_id)` triple are kept
+as separate events. If the document says a payment happened twice, that is two edges. The
+downstream graph handles it.
 
 ---
 
@@ -35,94 +45,94 @@ Chunker  →  Entity Extractor (×N chunks)  →  [Normalizer]  →  Disambiguat
 
 ```
 nlp/
-  normalizer/
+  clusterer/
     __init__.py
-    service.py            ← orchestration: build prompt, call LLM, post-process, return
-    merger.py             ← pure-Python edge merging logic (no LLM)
+    service.py          ← orchestration: clustering call + pronoun resolution + endpoint wiring
     prompts/
-      resolution.txt      ← system prompt for entity clustering
-    ollama_client.py      ← calls /api/chat with resolution schema
+      cluster.txt       ← system prompt for entity clustering
+      resolve.txt       ← system prompt for pronoun / role resolution
+    ollama_client.py    ← /api/chat wrapper (same pattern as entity_extractor/ollama_client.py)
 
 api/
   routers/
-    normalize.py          ← POST /normalize
+    cluster.py          ← POST /cluster
 ```
 
 ---
 
 ## Data contracts
 
-### Request — `POST /normalize`
+### Request — `POST /cluster`
 
 ```python
 class ChunkExtraction(BaseModel):
     chunk_id:   str
-    char_start: int
+    char_start: int           # absolute offset of chunk in document
     char_end:   int
-    entities:   list[ExtractedEntity]    # from EntityExtractResponse
-    relations:  list[ExtractedRelation]  # from EntityExtractResponse
+    text:       str           # original chunk text (needed for pronoun context)
+    entities:   list[ExtractedEntity]
+    relations:  list[ExtractedRelation]
 
-class NormalizeRequest(BaseModel):
+class ClusterRequest(BaseModel):
     doc_id:   str
     use_case: str
-    chunks:   list[ChunkExtraction]      # all chunks for this document, ordered
+    chunks:   list[ChunkExtraction]   # all chunks for the document, ordered
 ```
 
-### Response — `NormalizeResponse`
+### Response — `ClusterResponse`
 
 ```python
 class EntityMention(BaseModel):
     text:       str     # surface form as extracted
     chunk_id:   str
     char_start: int     # absolute offset (chunk.char_start + span.start)
-    char_end:   int     # absolute offset (chunk.char_start + span.end)
-    confidence: float
+    char_end:   int
 
 class LocalEntity(BaseModel):
-    local_id:       str             # e.g. "e001", scoped to this document
+    local_id:       str           # e.g. "e001", scoped to this document
     canonical_name: str
     type:           str
     subtype:        str | None
-    description:    str             # synthesised from all mention descriptions
+    description:    str           # from the LLM clustering call
     mentions:       list[EntityMention]
+    attributes:     dict[str, Any] = {}   # union of non-null attributes from mentions
 
-class MergedEdge(BaseModel):
+class LocalEdge(BaseModel):
     head_local_id:  str
-    relation:       str             # canonical type from ontology
+    relation:       str
     tail_local_id:  str
-    description:    str             # synthesised from all relation descriptions
-    attributes:     RelationAttributes   # merged (see rules below)
-    evidence:       list[EvidenceSpan]   # one per source chunk
+    description:    str
+    attributes:     dict[str, Any] = {}
+    evidence_span:  AbsoluteSpan          # absolute offsets
 
-class EvidenceSpan(BaseModel):
+class AbsoluteSpan(BaseModel):
     chunk_id:   str
-    char_start: int     # absolute
+    char_start: int
     char_end:   int
-    text:       str     # the evidence sentence(s)
+    text:       str               # evidence sentence(s)
 
-class NormalizeResponse(BaseModel):
-    doc_id:           str
-    local_entities:   list[LocalEntity]
-    edges:            list[MergedEdge]
+class ClusterResponse(BaseModel):
+    doc_id:         str
+    local_entities: list[LocalEntity]
+    edges:          list[LocalEdge]
 ```
 
 ---
 
 ## Algorithm
 
-### Step 1 — Flatten all mentions across chunks
+### Step 1 — Flatten all mentions (pure Python)
 
-Collect every `ExtractedEntity` from every chunk into a flat list. Each entry retains its
-`chunk_id` and absolute offset (computed by adding `chunk.char_start` to the entity's
-relative span). This is pure Python, no LLM.
+Collect every `ExtractedEntity` from every chunk into a numbered flat list. Compute
+absolute offsets (`chunk.char_start + span.start/end`) for each mention.
 
 ### Step 2 — Entity clustering (LLM call)
 
-Build the resolution prompt: include the flat entity list with types, descriptions, and a
-representative context sentence (the text surrounding the span). Ask the LLM to assign a
-`cluster_id` to each mention.
+Send the flat mention list to the LLM with the `cluster.txt` prompt. The LLM assigns each
+mention to a cluster by integer index (not by repeating name strings — indices are
+unambiguous and token-efficient).
 
-The LLM output schema is intentionally minimal to keep constrained decoding fast:
+**Output schema:**
 
 ```jsonc
 {
@@ -136,12 +146,12 @@ The LLM output schema is intentionally minimal to keep constrained decoding fast
         "required": ["cluster_id", "canonical_name", "type", "subtype", "description", "mention_indices"],
         "additionalProperties": false,
         "properties": {
-          "cluster_id":     {"type": "string"},
-          "canonical_name": {"type": "string"},
-          "type":           {"enum": [...]},
-          "subtype":        {"oneOf": [{"enum": [...]}, {"type": "null"}]},
-          "description":    {"type": "string"},
-          "mention_indices":{"type": "array", "items": {"type": "integer"}}
+          "cluster_id":      {"type": "string"},
+          "canonical_name":  {"type": "string"},
+          "type":            {"enum": ["PERSON", "ORGANIZATION", ...]},
+          "subtype":         {"oneOf": [{"enum": [...]}, {"type": "null"}]},
+          "description":     {"type": "string"},
+          "mention_indices": {"type": "array", "items": {"type": "integer"}}
         }
       }
     }
@@ -149,83 +159,123 @@ The LLM output schema is intentionally minimal to keep constrained decoding fast
 }
 ```
 
-`mention_indices` references positions in the flat mention list passed in the prompt. This
-avoids asking the LLM to repeat name strings (error-prone) — it uses integer indices instead.
+Each entry in `mention_indices` is the 0-based position in the flat mention list.
 
-**Context window management:** If the flat mention list exceeds ~80 entities (uncommon for
-journalism documents), split into batches by type and run multiple clustering calls, then
-merge clusters that share identical canonical names across batches.
+**Assign `local_id`**: after the LLM returns, assign `e001`, `e002`, … in cluster order
+(pure Python, stable within this document).
 
-### Step 3 — Build `LocalEntity` objects (pure Python)
+**Validation**: every mention index must appear in exactly one cluster. Unclustered indices
+are logged at WARNING and placed in singleton clusters.
 
-For each cluster returned by the LLM:
-- Assign `local_id = f"e{i:03d}"` (stable within this document)
-- Collect all `EntityMention` objects using `mention_indices`
-- Use the LLM-provided `description` as the entity description (it has seen all mentions)
+**Batching**: if the flat mention list exceeds `CLUSTER_ENTITY_BATCH` (default 80), split
+by type and run one clustering call per type batch. After all calls, merge clusters that
+share the same `canonical_name` across batches (case-insensitive).
 
-Validate that every input mention appears in exactly one cluster. Unclustered mentions (LLM
-omission) are logged at WARNING and added as singleton clusters.
+### Step 3 — Pronoun and role resolution (LLM call, optional)
 
-### Step 4 — Edge deduplication (pure Python, `merger.py`)
+If the document contains entity mentions whose `type` was not determinable or whose surface
+form is a pronoun ("he", "she", "they") or a pure role title ("the minister", "the CEO"),
+send a second constrained call with the `resolve.txt` prompt.
 
-The LLM is not involved in edge deduplication. This is deterministic:
+Input: the list of unresolved mentions + the `LocalEntity` list produced in Step 2 as
+resolution candidates.
 
-1. **Endpoint resolution:** Replace each relation's `head`/`tail` name string with a
-   `local_id` by matching against `EntityMention.text` for each cluster.
+Output schema:
 
-   - Exact match first; if no match, normalise (lowercase, strip punctuation) and retry.
-   - If still no match, log WARNING and set `head_local_id = null` (edge is kept but
-     flagged for review).
+```jsonc
+{
+  "type": "object",
+  "required": ["resolutions"],
+  "properties": {
+    "resolutions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["mention_index", "resolved_local_id"],
+        "additionalProperties": false,
+        "properties": {
+          "mention_index":     {"type": "integer"},
+          "resolved_local_id": {"oneOf": [{"type": "string"}, {"type": "null"}]}
+        }
+      }
+    }
+  }
+}
+```
 
-2. **Group by `(head_local_id, relation, tail_local_id)`.**
+`null` means the LLM could not resolve — those mentions stay unlinked and are excluded from
+edges but logged at DEBUG.
 
-3. **Merge attributes** per relation type rules:
-   - `amount`: sum all non-null values (multiple payments in same document)
-   - `currency`: use the value if unanimous; `"MIXED"` otherwise
-   - `date`: collect as a sorted list, expose as `date_range: [min, max]`
-   - `direction`: unanimous value; `"MIXED"` otherwise
+Step 3 is skipped entirely if no unresolved mentions are detected (saves one LLM call for
+the common case).
 
-4. **Merge descriptions:** concatenate with `" | "` separator. The summarizer's
-   `describe_entity` can refresh this later as evidence accumulates.
+### Step 4 — Endpoint resolution (pure Python)
 
-5. **Collect evidence spans:** one per source relation, converted to absolute offsets.
+For each `ExtractedRelation`, look up `head` and `tail` (surface strings) in the mention
+→ `local_id` map produced in Steps 2–3:
+
+1. Exact string match first.
+2. If no match, normalise (lowercase, strip punctuation) and retry.
+3. If still no match, log WARNING and set `head_local_id` / `tail_local_id = null`; keep the
+   edge (flagged for downstream review via low confidence).
+
+Absolute evidence offsets are computed from `chunk.char_start + relation.evidence_span.*`.
+
+### Step 5 — Return `ClusterResponse`
+
+No further merging or deduplication. Multiple edges with the same `(head_local_id, relation,
+tail_local_id)` are kept as-is — they represent distinct events.
 
 ---
 
-## Prompt template (`resolution.txt`)
+## Prompt templates
+
+### `cluster.txt`
 
 ```
 You are resolving entity mentions to canonical identities within a single document.
-You will receive a numbered list of entity mentions with their types and descriptions.
+You will receive a numbered list of entity mentions with their types and surrounding context.
 Group mentions that refer to the same real-world entity into clusters.
+
+ENTITY TYPES
+============
+{ontology_entity_types}
 
 RULES
 =====
 - Assign every mention to exactly one cluster.
 - Choose the most complete, unambiguous name as canonical_name (full name over nickname,
-  legal name over alias).
-- Keep type and subtype consistent within a cluster; if a mention was wrongly typed, use
-  the majority type.
-- Write a single-sentence description that covers all mentions in the cluster.
-- Only cluster mentions of the same broad type (do not merge a PERSON into an ORGANIZATION).
-- Use the integer index from the list (0-based) in mention_indices.
+  official name over alias).
+- Keep type consistent within a cluster. If a mention was mis-typed, use the majority type.
+- Write a concise single-sentence description covering all mentions in the cluster.
+- Do not merge entities of different broad types (never merge a PERSON into an ORGANIZATION).
+- Use the integer index (0-based) in mention_indices — do not repeat name strings.
 
 MENTIONS
 ========
 {mention_list}
 ```
 
----
+### `resolve.txt`
 
-## Edge cases
+```
+You are resolving pronouns and role references to named entities already identified in
+this document.
 
-| Situation | Handling |
-|---|---|
-| Document has only one chunk | Skip LLM call if fewer than 2 distinct entity names across the chunk. Return a trivial 1:1 cluster per entity. |
-| LLM assigns same `cluster_id` to two different real entities | Post-check: if two mentions in a cluster have incompatible types, split and log ERROR. |
-| Relation head or tail names a mention not in any cluster | Log WARNING, mark edge with `unresolved=true`; persist for review. |
-| Attribute conflict (e.g. two different amounts for PAYMENT_TO) | Sum them; include both raw values in `evidence`. |
-| Empty document (zero chunks) | Return empty `local_entities` and `edges`; no LLM call. |
+KNOWN ENTITIES
+==============
+{entity_list}
+
+UNRESOLVED MENTIONS
+===================
+{unresolved_list}
+
+RULES
+=====
+- For each unresolved mention, output its index and the local_id of the entity it refers to.
+- Set resolved_local_id to null if you cannot determine the referent with confidence.
+- Do not invent new entities — only resolve to entities in the KNOWN ENTITIES list.
+```
 
 ---
 
@@ -233,24 +283,25 @@ MENTIONS
 
 | Env var | Default | Description |
 |---|---|---|
-| `NORMALIZATION_MODEL` | `qwen2.5:32b` | Ollama model for entity clustering |
-| `NORMALIZATION_TIMEOUT` | `180` | Seconds per Ollama call |
-| `NORMALIZATION_ENTITY_BATCH` | `80` | Max mentions per clustering call before batching |
+| `CLUSTER_MODEL` | `gemma4:31b` | Ollama model for clustering and resolution |
+| `CLUSTER_TIMEOUT` | `120` | Seconds per Ollama call |
+| `CLUSTER_ENTITY_BATCH` | `80` | Max mentions per clustering call before batching |
 | `OLLAMA_HOST` | `http://ollama:11434` | Shared |
 
 ---
 
 ## Testing
 
-See [06-testing.md](06-testing.md) §2 — `merger.py` is fully unit-testable (no LLM);
-LLM clustering is tested with a mocked Ollama response. Key cases: amount summing,
-mixed currency, unresolved endpoints.
+See [06-testing.md](06-testing.md) §2 — Steps 1, 4, and 5 are pure Python and fully
+unit-testable without mocking. LLM clustering (Step 2) and resolution (Step 3) are tested
+with a mocked Ollama response. Key cases: overlapping spans, unclustered mention fallback,
+no-pronoun fast path (Step 3 skipped), unresolved endpoint fallback.
 
 ---
 
 ## Dependencies
 
-- `nlp/schema.py` — for entity and relation type enums in schema
+- `nlp/schema.py` — entity type enum for output schema and prompts
 - Ollama sidecar
 - `httpx` — already in requirements.txt
 - No new packages
