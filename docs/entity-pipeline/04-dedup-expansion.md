@@ -59,6 +59,7 @@ api/
 
 class ArticleDedupRequest(BaseModel):
     type:       Literal["article"] = "article"
+    use_case:   str                          # pipeline identifier — indexes are namespaced by this
     article_id: str
     text:       str
     embedding:  list[float] | None = None   # 384-dim MiniLM; computed inline if absent
@@ -119,12 +120,14 @@ unchanged) uses **128 hash permutations** and **3-word shingles**, with a defaul
 of 0.9 Jaccard similarity. Any two articles with ≥ 90% overlapping 3-gram vocabulary are
 treated as near-duplicates without ever touching Weaviate.
 
-**Where it lives:** The `MinHashLSH` object and its per-article MinHash signatures live in
-the NLP service process memory (the global `_mh` in `service.py`). They are loaded from a
-pickle file at startup and flushed back to disk every `DEDUP_PERSIST_EVERY_N` articles. The
-file path is `DEDUP_DATA_DIR/minhash_lsh.pkl` (default `/data/dedup/`). This path **must
-be a Docker volume mount** — if it is not, the index resets to empty on every container
-restart and MinHash provides no benefit until it is rebuilt by processing real traffic.
+**Where it lives:** The `MinHashLSH` objects live in the NLP service process memory as a
+dict keyed by `use_case`: `_mh: dict[str, MinHashIndex]`. Each pipeline gets its own
+independent index — articles from `financial_flows` are never checked against articles from
+another use case. They are loaded from pickle files on first use and flushed back to disk
+every `DEDUP_PERSIST_EVERY_N` articles. The file for each use case is
+`DEDUP_DATA_DIR/{use_case}/minhash_lsh.pkl` (e.g. `/data/dedup/financial_flows/minhash_lsh.pkl`).
+This directory **must be a Docker volume mount** — without it the indexes reset to empty on
+every container restart.
 
 **Size:** Each article contributes one MinHash signature (128 × 4 bytes = 512 bytes) stored
 in `_signatures`, plus entries in the LSH band tables (datasketch creates ≈ 25 bands for
@@ -141,19 +144,18 @@ Stage 1 is handled entirely by the existing `minhash_index.py` logic, unchanged.
 
 ### Stage 2 — Weaviate embedding search
 
-If MinHash misses, compute a 384-dim embedding (MiniLM-L12-v2) and query Weaviate for
-the nearest article above `DEDUP_ARTICLE_THRESHOLD`. On a non-duplicate decision, add
-the article to both the MinHash index and Weaviate so future articles are checked
-against it.
+If MinHash misses, compute a 384-dim embedding (MiniLM-L12-v2) and query the
+`Articles_{use_case}` Weaviate collection for the nearest article above
+`DEDUP_ARTICLE_THRESHOLD`. On a non-duplicate decision, add the article to both the
+MinHash index and Weaviate so future articles are checked against it.
 
 ### `nlp/dedup/article_index.py`
 
 ```python
 class ArticleIndex:
-    COLLECTION = "Articles"
-
-    def __init__(self, weaviate_client) -> None:
+    def __init__(self, use_case: str, weaviate_client) -> None:
         self._client = weaviate_client
+        self._collection = f"Articles_{use_case}"   # one collection per pipeline
 
     def find_near_duplicate(
         self,
@@ -162,7 +164,7 @@ class ArticleIndex:
     ) -> tuple[str | None, float]:
         """Return (article_id, cosine_score) of nearest article, or (None, 0.0)."""
         results = (
-            self._client.collections.get(self.COLLECTION)
+            self._client.collections.get(self._collection)
             .query.near_vector(
                 near_vector=embedding,
                 limit=1,
@@ -177,7 +179,7 @@ class ArticleIndex:
         return (obj.properties["article_id"], score) if score >= threshold else (None, 0.0)
 
     def add(self, article_id: str, embedding: list[float]) -> None:
-        self._client.collections.get(self.COLLECTION).data.insert(
+        self._client.collections.get(self._collection).data.insert(
             properties={"article_id": article_id},
             vector=embedding,
         )
@@ -185,32 +187,45 @@ class ArticleIndex:
 
 ### `service.py` — article check
 
+`_mh` and `_lock` are dicts keyed by `use_case`. `_load(use_case)` loads the pickle from
+`DEDUP_DATA_DIR/{use_case}/minhash_lsh.pkl` on first call for that use case and is a
+no-op on subsequent calls.
+
 ```python
+_mh:    dict[str, MinHashIndex] = {}
+_locks: dict[str, threading.Lock] = {}
+
+def _load(use_case: str) -> None:
+    if use_case not in _mh:
+        _mh[use_case] = persistence.load_minhash(use_case)
+        _locks[use_case] = threading.Lock()
+
 def check(req: ArticleDedupRequest) -> ArticleDedupResponse:
-    load()   # loads MinHash index from file if not already loaded
-    with _lock:
+    _load(req.use_case)
+    with _locks[req.use_case]:
+        mh = _mh[req.use_case]
+
         # Stage 1 — MinHash
-        if _ids.has(req.article_id):
+        if req.article_id in mh:
             return ArticleDedupResponse(duplicate_of=req.article_id, score=1.0,
                                         stage="minhash", indexed=False)
-        best_aid, jaccard = _mh.query(req.text)
-        if best_aid and jaccard >= _mh.threshold:
+        best_aid, jaccard = mh.query(req.text)
+        if best_aid and jaccard >= mh.threshold:
             return ArticleDedupResponse(duplicate_of=best_aid, score=jaccard,
                                         stage="minhash", indexed=False)
 
         # Stage 2 — Weaviate
         vec = req.embedding or _encode(req.text)
-        idx = ArticleIndex(_get_weaviate_client())
+        idx = ArticleIndex(req.use_case, _get_weaviate_client())
         dup_id, score = idx.find_near_duplicate(vec, _ARTICLE_THRESHOLD)
         if dup_id:
             return ArticleDedupResponse(duplicate_of=dup_id, score=score,
                                         stage="embedding", indexed=False)
 
         # Not a duplicate — index in both
-        _mh.add(req.article_id, req.text)
-        _ids.add(req.article_id)
+        mh.add(req.article_id, req.text)
         idx.add(req.article_id, vec)
-        _maybe_flush()
+        _maybe_flush(req.use_case)
         return ArticleDedupResponse(duplicate_of=None, score=None,
                                     stage=None, indexed=True)
 ```
@@ -354,7 +369,7 @@ Created per-request; SDK manages connection pool internally.
 
 | Env var | Default | Description |
 |---|---|---|
-| `MINHASH_PATH` | `data/dedup_minhash.pkl` | File path for MinHash index persistence |
+| `DEDUP_DATA_DIR` | `/data/dedup` | Root dir for MinHash pickle files; one subdir per use case |
 | `DEDUP_PERSIST_EVERY_N` | `10` | Flush MinHash to file every N indexed articles |
 | `DEDUP_ARTICLE_THRESHOLD` | `0.85` | Weaviate cosine threshold for article duplicates |
 | `DISAMBIG_MERGE_THRESHOLD` | `0.92` | Entity: auto-merge above |
