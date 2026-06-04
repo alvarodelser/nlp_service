@@ -191,11 +191,9 @@ RULES
 - Spans are CHARACTER OFFSETS relative to the start of the chunk (first character = 0).
 - A relation's head and tail must be entity names you have already listed.
 - Use only the entity and relation types listed above — the schema is fixed.
-- Extract all entity mentions including pronouns and aliases.
-- If a pronoun (he, she, they, it) or bare role title ("the minister", "the CEO") has no
-  named antecedent in this chunk, use [PRONOUN] as the entity name and set confidence to 0.3.
-  Do not skip the relation — preserve the span and all attributes.
-- [PRONOUN] entities will be resolved in a later step using the full document context.
+- Extract named entities only. Do not extract bare pronouns or role titles that cannot be
+  identified by name in this chunk. If a relation's head or tail is a pronoun with no
+  named antecedent here, skip that relation rather than guessing.
 ```
 
 ---

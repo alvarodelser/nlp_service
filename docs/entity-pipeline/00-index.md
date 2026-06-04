@@ -67,16 +67,14 @@ Article Dedup   POST /dedup  (type: "article")
 - **No edge merging.** Multiple edges between the same entity pair are valid distinct
   events. No amount summing, no attribute merging, no deduplication of relations.
 
-- **`[PRONOUN]` token for unresolved pronouns.** If the extractor finds a pronoun or bare
-  role title with no named antecedent in the same chunk, it uses `[PRONOUN]` as the entity
-  name (confidence 0.3) and preserves the relation and its span. The clusterer resolves
-  these against the full document's named entity list in the same combined LLM call —
-  `[PRONOUN]` mentions are annotated `NEEDS_RESOLUTION` in the prompt.
+- **No pronoun extraction.** The extractor skips relations whose head or tail cannot be
+  named within the same chunk. Named entities only — no special tokens, no deferred
+  resolution.
 
 - **Jaccard name hints in clusterer prompt.** Before the LLM call, word-token Jaccard is
-  computed for all mention pairs. Pairs ≥ 0.5 are annotated `LIKELY_SAME` in the prompt;
-  `[PRONOUN]` mentions are annotated `NEEDS_RESOLUTION`. No rule-based resolution — the LLM
-  makes all decisions using these annotations as hints.
+  computed for all mention pairs. Pairs ≥ 0.5 are annotated `LIKELY_SAME` in the prompt.
+  The LLM makes all clustering decisions; Jaccard provides focused hints to reduce its
+  search space.
 
 - **Combined clustering + edge wiring in one LLM call.** The clusterer prompt includes both
   the flat entity mention list and the flat relation list. The LLM returns clusters with
