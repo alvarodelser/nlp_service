@@ -61,12 +61,32 @@ class ExtractedSpan(BaseModel):
     start: int    # character offset relative to chunk start
     end:   int
 
+class EntityAttributes(BaseModel):
+    # Keys are the union of all entity attribute names defined in the schema config.
+    # All nullable — the LLM fills what the text supports; schema.system_prompt()
+    # instructs it which attributes are required per type.
+    nationality:         str   | None = None
+    role_title:          str   | None = None
+    date_of_birth:       str   | None = None
+    jurisdiction:        str   | None = None
+    registration_number: str   | None = None
+    founding_date:       str   | None = None
+    account_type:        str   | None = None
+    institution:         str   | None = None
+    currency:            str   | None = None
+    country_code:        str   | None = None
+    jurisdiction_type:   str   | None = None
+    date:                str   | None = None
+    event_type:          str   | None = None
+    # model_config = ConfigDict(extra="allow") if schema introduces new attributes
+
 class ExtractedEntity(BaseModel):
     name:        str
-    type:        str            # validated against ontology enum
+    type:        str            # validated against schema enum (includes __NOVEL__)
     subtype:     str | None
     description: str
     span:        ExtractedSpan
+    attributes:  EntityAttributes = EntityAttributes()
     confidence:  float
 
 class RelationAttributes(BaseModel):
@@ -147,8 +167,10 @@ before returning:
 | `span.end > span.start` | set `confidence = 0.0`, log WARNING |
 | `span.end <= len(text)` | clamp to `len(text)`, log WARNING |
 | `subtype` belongs to parent `type` | set `subtype = null`, log WARNING |
+| entity `required: true` attribute is null | multiply `confidence` by 0.6, add `review_flag` |
 | relation `head` or `tail` not found in `entities[].name` | log WARNING, keep relation |
 | `relation` `head_types`/`tail_types` violated | log WARNING, keep relation |
+| relation `required: true` attribute is null | multiply `confidence` by 0.6, add `review_flag` |
 
 No extraction is silently dropped. Failures are flagged in logs and via `confidence=0.0`
 so the normalizer can filter them.
@@ -175,11 +197,16 @@ RULES
 =====
 - Assign confidence between 0.0 (very uncertain) and 1.0 (certain).
 - Use subtype only when you are confident; set to null otherwise.
+- For entities, fill every attribute the text explicitly supports; set the rest to null.
 - For relations, capture every attribute that is explicitly stated; set others to null.
+- The ATTRIBUTE REQUIREMENTS section below lists which attributes are required per type;
+  missing a required attribute lowers your confidence score for that entity or relation.
 - Spans are CHARACTER OFFSETS relative to the start of the chunk (first character = 0).
 - A relation's head and tail must be entity names you have already listed.
-- If a relation's type does not fit any ontology type, do not extract it.
-- Extract all entity mentions, including pronouns and aliases — the resolver will cluster them.
+- If an entity type does not fit any listed type, use __NOVEL__.
+- If a relation type does not fit any listed type, use __UNCLASSIFIED__ and preserve the
+  original phrase in the description field.
+- Extract all entity mentions including pronouns and aliases — the resolver will cluster them.
 ```
 
 ---
