@@ -321,29 +321,32 @@ from nlp.schema import load, ExtractionSchema
 
 schema: ExtractionSchema = load("financial_flows")  # cached after first call
 
-schema.entity_type_names()              # -> ["PERSON", "ORGANIZATION", ..., "__NOVEL__"]
-schema.subtype_names()                  # -> ["POLITICIAN", "EXECUTIVE", ...] (all, pooled)
-schema.relation_type_names()            # -> ["PAYMENT_TO", "OWNS", ..., "__UNCLASSIFIED__"]
-schema.entity_type("ORGANIZATION")      # -> EntityType(...)
-schema.relation_type("PAYMENT_TO")      # -> RelationType(...)
+schema.entity_type_names()                     # -> ["PERSON", "ORGANIZATION", ...]
+schema.subtype_names()                         # -> ["POLITICIAN", "EXECUTIVE", ...] (pooled)
+schema.relation_type_names()                   # -> ["PAYMENT_TO", "OWNS", ...]
+schema.entity_type("ORGANIZATION")             # -> EntityType(...)
+schema.relation_type("PAYMENT_TO")             # -> RelationType(...)
+schema.subtypes_for("ORGANIZATION")            # -> ["SHELL_COMPANY", "BANK", ...]
 schema.validate_subtype("POLITICIAN", parent="PERSON")  # -> True
 
-# All entity attribute keys across all types (union, for JSON Schema generation)
-schema.all_entity_attribute_keys()      # -> ["nationality", "role_title", "jurisdiction", ...]
-
-# All relation attribute keys across all types (union)
-schema.all_relation_attribute_keys()    # -> ["amount", "currency", "date", "stake_pct", ...]
-
-# Required attribute keys for a given type
-schema.required_entity_attrs("PERSON")         # -> ["nationality", ...] (those with required: true)
+# Required attribute keys for post-extraction validation
+schema.required_entity_attrs("ORGANIZATION")   # -> [] (none required in financial_flows)
 schema.required_relation_attrs("PAYMENT_TO")   # -> ["amount", "currency"]
 
-schema.extraction_schema()    # -> dict  (JSON Schema for Ollama format=, includes entity attributes)
-schema.system_prompt()        # -> str   (type descriptions + per-type attribute requirements table)
-schema.weaviate_collection_spec()  # -> dict  (Weaviate collection definition)
+# Three rule-based emitters — no intelligence, just loops over the parsed YAML
+schema.extraction_schema()             # -> dict  (JSON Schema for Ollama format=)
+schema.system_prompt()                 # -> str   (per-type descriptions + attribute requirements)
+schema.weaviate_collection_spec()      # -> dict  (Weaviate collection definition)
 ```
 
 ### `extraction_schema()` output structure
+
+The grammar enforces the outer shape of the output — required fields, type/relation enums,
+span structure. The `attributes` field is left as a free JSON object: the grammar only
+guarantees it is a valid object, nothing more. Attribute keys and value types are guided
+entirely by `system_prompt()` and validated in application code after the fact.
+
+This avoids polluting every entity and relation with null keys that belong to other types.
 
 ```jsonc
 {
@@ -355,41 +358,16 @@ schema.weaviate_collection_spec()  # -> dict  (Weaviate collection definition)
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["name", "type", "description", "span", "confidence"],
+        "required": ["name", "type", "description", "span", "attributes", "confidence"],
         "additionalProperties": false,
         "properties": {
           "name":        {"type": "string"},
-          "type":        {"enum": ["PERSON", "ORGANIZATION", ...]},  // closed — only schema-defined types
+          "type":        {"enum": ["PERSON", "ORGANIZATION", ...]},
           "subtype":     {"oneOf": [{"enum": ["POLITICIAN", ...]}, {"type": "null"}]},
           "description": {"type": "string"},
-          "span":        {
-            "type": "object",
-            "required": ["start", "end"],
-            "properties": {
-              "start": {"type": "integer"},
-              "end":   {"type": "integer"}
-            }
-          },
-          "attributes": {
-            "type": "object",
-            // Union of all entity attribute keys across all types; all nullable.
-            // System prompt carries per-type requirements (which are required/optional).
-            "properties": {
-              "nationality":         {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "role_title":          {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "date_of_birth":       {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "jurisdiction":        {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "registration_number": {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "founding_date":       {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "account_type":        {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "institution":         {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "currency":            {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "country_code":        {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "jurisdiction_type":   {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "date":                {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "event_type":          {"oneOf": [{"type": "string"}, {"type": "null"}]}
-            }
-          },
+          "span":        {"type": "object", "required": ["start","end"],
+                          "properties": {"start": {"type":"integer"}, "end": {"type":"integer"}}},
+          "attributes":  {"type": "object"},   // free — keys vary per entity type
           "confidence":  {"type": "number", "minimum": 0, "maximum": 1}
         }
       }
@@ -398,31 +376,17 @@ schema.weaviate_collection_spec()  # -> dict  (Weaviate collection definition)
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["head", "relation", "tail", "description", "evidence_span", "confidence"],
+        "required": ["head", "relation", "tail", "description", "evidence_span", "attributes", "confidence"],
         "additionalProperties": false,
         "properties": {
           "head":          {"type": "string"},
-          "relation":      {"enum": ["PAYMENT_TO", "OWNS", ...]},  // closed — only schema-defined types
+          "relation":      {"enum": ["PAYMENT_TO", "OWNS", ...]},
           "tail":          {"type": "string"},
           "description":   {"type": "string"},
-          "evidence_span": {
-            "type": "object",
-            "required": ["start", "end"],
-            "properties": {
-              "start": {"type": "integer"},
-              "end":   {"type": "integer"}
-            }
-          },
-          "attributes": {
-            "type": "object",
-            "properties": {
-              "amount":    {"oneOf": [{"type": "number"}, {"type": "null"}]},
-              "currency":  {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "date":      {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "direction": {"oneOf": [{"type": "string"}, {"type": "null"}]}
-            }
-          },
-          "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+          "evidence_span": {"type": "object", "required": ["start","end"],
+                            "properties": {"start": {"type":"integer"}, "end": {"type":"integer"}}},
+          "attributes":    {"type": "object"},   // free — keys vary per relation type
+          "confidence":    {"type": "number", "minimum": 0, "maximum": 1}
         }
       }
     }
@@ -430,30 +394,47 @@ schema.weaviate_collection_spec()  # -> dict  (Weaviate collection definition)
 }
 ```
 
-Notes:
-- Entity `attributes` is the union of all entity types' attribute keys; all nullable.
-- Relation `attributes` is the union of all relation types' attribute keys; all nullable.
-- Ollama constrained decoding guarantees structural validity (correct types, no unknown keys).
-- Semantic validity (e.g. `amount` filled for PAYMENT_TO, `jurisdiction` for ORGANIZATION)
-  is enforced via the system prompt and checked post-hoc: missing `required: true` attributes
-  reduce confidence and raise a review flag. The LLM is never forced to hallucinate a value.
-- `system_prompt()` generates a human-readable attribute requirements table injected into
-  the extraction system prompt:
+### `system_prompt()` output — per-type attribute section
 
-  ```
-  ENTITY ATTRIBUTE REQUIREMENTS
-  ==============================
-  PERSON         → role_title (optional), nationality (optional), date_of_birth (optional)
-  ORGANIZATION   → jurisdiction (optional), registration_number (optional), founding_date (optional)
-  FINANCIAL_ENTITY → account_type (optional), institution (optional), currency (optional)
+Each type only sees its own attributes. The LLM never sees attribute names from other types
+while writing a given entity or relation, so there is no cross-contamination.
+
+```
+ENTITY TYPES
+============
+PERSON: A natural person referenced by name, title, pronoun, or alias...
+  POLITICIAN: Elected or appointed public official.
+  EXECUTIVE: Senior corporate officer (CEO, CFO, board member).
+  INTERMEDIARY: Lawyer, accountant, nominee director...
+ORGANIZATION: Any formal or informal group...
   ...
 
-  RELATION ATTRIBUTE REQUIREMENTS
-  ================================
-  PAYMENT_TO     → amount (REQUIRED), currency (REQUIRED), date (optional), direction (optional)
-  OWNS           → stake_pct (optional), date (optional)
-  ...
-  ```
+RELATION TYPES
+==============
+PAYMENT_TO  (PERSON | ORGANIZATION | FINANCIAL_ENTITY) → (PERSON | ORGANIZATION | FINANCIAL_ENTITY)
+  One party transfers money or assets to another.
+OWNS  (PERSON | ORGANIZATION) → (ORGANIZATION | FINANCIAL_ENTITY)
+  One party holds an ownership stake in another.
+...
+
+ATTRIBUTE REQUIREMENTS
+======================
+  PERSON               → optional: role_title, nationality, date_of_birth
+  ORGANIZATION         → optional: jurisdiction, registration_number, founding_date
+  FINANCIAL_ENTITY     → optional: account_type, institution, currency
+  LOCATION             → optional: country_code, jurisdiction_type
+  EVENT                → optional: date, event_type
+
+  PAYMENT_TO           → REQUIRED: amount, currency;  optional: date, direction
+  OWNS                 → optional: stake_pct, date
+  MEMBER_OF            → optional: role, date_from, date_to
+  REGISTERED_IN        → optional: date
+  PARTY_TO             → optional: role
+```
+
+Post-extraction, application code calls `schema.required_relation_attrs("PAYMENT_TO")`
+to check which attributes must be non-null, and `schema.entity_type("PERSON").attributes`
+to know what keys to expect and coerce to the right Python types.
 
 ### `weaviate_collection_spec()` output structure
 
@@ -485,11 +466,11 @@ share a collection. Migrations create a new collection, backfill, then reroute w
 ### Caching
 
 ```python
-_cache: dict[str, Ontology] = {}
+_cache: dict[str, ExtractionSchema] = {}
 
-def load(use_case: str) -> Ontology:
+def load(use_case: str) -> ExtractionSchema:
     if use_case not in _cache:
-        path = _ONTOLOGY_DIR / f"{use_case}.yaml"
+        path = _SCHEMA_DIR / f"{use_case}.yaml"
         _cache[use_case] = _load_and_validate(path)
     return _cache[use_case]
 ```
