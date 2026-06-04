@@ -191,9 +191,7 @@ RULES
 - Spans are CHARACTER OFFSETS relative to the start of the chunk (first character = 0).
 - A relation's head and tail must be entity names you have already listed.
 - Use only the entity and relation types listed above — the schema is fixed.
-- Extract named entities only. Do not extract bare pronouns or role titles that cannot be
-  identified by name in this chunk. If a relation's head or tail is a pronoun with no
-  named antecedent here, skip that relation rather than guessing.
+- Extract all entity mentions including aliases — the clusterer will resolve duplicates.
 ```
 
 ---
