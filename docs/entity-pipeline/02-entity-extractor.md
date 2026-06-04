@@ -56,67 +56,54 @@ class EntityExtractRequest(BaseModel):
 
 ### Response — `EntityExtractResponse`
 
+The attribute fields on both entities and relations are **use-case-specific** — their keys
+and value types come from the loaded type catalogue, not from this module. The Pydantic
+models use `dict[str, Any]` as the container; the actual structure is constrained at
+runtime by the JSON Schema that `schema.extraction_schema()` generates and passes to
+Ollama as `format=`. Post-extraction validation checks required attributes against
+`schema.required_entity_attrs(type)` and `schema.required_relation_attrs(relation)`.
+
 ```python
 class ExtractedSpan(BaseModel):
     start: int    # character offset relative to chunk start
     end:   int
 
-class EntityAttributes(BaseModel):
-    # Keys are the union of all entity attribute names defined in the schema config.
-    # All nullable — the LLM fills what the text supports; schema.system_prompt()
-    # instructs it which attributes are required per type.
-    nationality:         str   | None = None
-    role_title:          str   | None = None
-    date_of_birth:       str   | None = None
-    jurisdiction:        str   | None = None
-    registration_number: str   | None = None
-    founding_date:       str   | None = None
-    account_type:        str   | None = None
-    institution:         str   | None = None
-    currency:            str   | None = None
-    country_code:        str   | None = None
-    jurisdiction_type:   str   | None = None
-    date:                str   | None = None
-    event_type:          str   | None = None
-    # model_config = ConfigDict(extra="allow") if schema introduces new attributes
-
 class ExtractedEntity(BaseModel):
     name:        str
-    type:        str            # validated against schema enum (closed set)
-    subtype:     str | None
+    type:        str              # runtime-validated against schema.entity_type_names()
+    subtype:     str | None       # runtime-validated against schema.subtypes_for(type)
     description: str
     span:        ExtractedSpan
-    attributes:  EntityAttributes = EntityAttributes()
+    attributes:  dict[str, Any] = {}  # keys defined by schema; vary per use case
     confidence:  float
 
-class RelationAttributes(BaseModel):
-    amount:    float | None = None
-    currency:  str   | None = None
-    date:      str   | None = None
-    direction: str   | None = None
-    # additional keys allowed for other use cases
-
 class ExtractedRelation(BaseModel):
-    head:          str             # entity name as written in the chunk
-    relation:      str             # canonical type, validated against ontology enum
+    head:          str            # entity name as written in the chunk
+    relation:      str            # runtime-validated against schema.relation_type_names()
     tail:          str
     description:   str
     evidence_span: ExtractedSpan
-    attributes:    RelationAttributes = RelationAttributes()
+    attributes:    dict[str, Any] = {}  # keys defined by schema; vary per use case
     confidence:    float
 
 class EntityExtractResponse(BaseModel):
-    doc_id:    str
-    chunk_id:  str
+    doc_id:     str
+    chunk_id:   str
     char_start: int
     char_end:   int
-    entities:  list[ExtractedEntity]
-    relations: list[ExtractedRelation]
+    entities:   list[ExtractedEntity]
+    relations:  list[ExtractedRelation]
 ```
 
+**Why `dict` instead of a typed model for attributes**: the attribute keys (e.g.
+`jurisdiction`, `role_title`, `amount`) are declared in the type catalogue YAML and differ
+per use case. Pydantic cannot know them at class-definition time. The constraint is enforced
+one level down — in the JSON Schema that Ollama's GBNF grammar compiles at request time —
+not in the Python type system. Any downstream consumer that needs typed access reads the
+attribute keys from `schema.entity_type(type).attributes`.
+
 Spans in the response are **relative to the chunk**. The normalizer or any downstream
-consumer adds `char_start` to convert to absolute document offsets. This keeps the
-extraction contract simple and the offset arithmetic in one place.
+consumer adds `char_start` to convert to absolute document offsets.
 
 ---
 
@@ -148,7 +135,7 @@ CHUNK [{chunk_id}] ({char_start}–{char_end}):
 ollama_client.extract(
     system=system_prompt,
     user=user_message,
-    schema=onto.extraction_schema(),   # JSON Schema enforces types as enums
+    schema=schema.extraction_schema(),  # generated at runtime from type catalogue
     model=EXTRACTION_MODEL,
     timeout=EXTRACTION_TIMEOUT,
 )
@@ -215,7 +202,7 @@ Separate from `nlp/summarizer/ollama_client.py` so extraction and summarization 
 different models and timeouts independently.
 
 ```python
-EXTRACTION_MODEL   = os.environ.get("EXTRACTION_MODEL",   "qwen2.5:32b")
+EXTRACTION_MODEL   = os.environ.get("EXTRACTION_MODEL",   "gemma4:31b")
 EXTRACTION_TIMEOUT = float(os.environ.get("EXTRACTION_TIMEOUT", "180"))
 
 def extract(system: str, user: str, schema: dict, ...) -> dict:
@@ -249,9 +236,9 @@ log at ERROR, raise (the router returns 503).
 def entity_extract(req: EntityExtractRequest) -> EntityExtractResponse:
     if not req.text.strip():
         raise HTTPException(422, "text must be non-empty")
-    onto = ontology.load(req.use_case)
+    schema = schema_loader.load(req.use_case)
     try:
-        result = entity_extractor_service.run(req, onto)
+        result = entity_extractor_service.run(req, schema)
     except httpx.HTTPError as exc:
         raise HTTPException(503, "ollama_unavailable")
     return result
@@ -263,7 +250,7 @@ def entity_extract(req: EntityExtractRequest) -> EntityExtractResponse:
 
 | Env var | Default | Description |
 |---|---|---|
-| `EXTRACTION_MODEL` | `qwen2.5:32b` | Ollama model tag for extraction |
+| `EXTRACTION_MODEL` | `gemma4:31b` | Ollama model tag for extraction |
 | `EXTRACTION_TIMEOUT` | `180` | Seconds per Ollama call |
 | `OLLAMA_HOST` | `http://ollama:11434` | Shared with summarizer |
 
