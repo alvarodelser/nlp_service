@@ -18,51 +18,29 @@ class SummarizeResponse(BaseModel):
 # --- Geotag ---
 
 class GeotagRequest(BaseModel):
-    article_id: str
-    text: str
-    headline: str = ""
-    source: str = ""
+    request_id: str | None = None
+    text:       str
+    headline:   str = ""
+    source:     str = ""
 
 
-class PlaceMention(BaseModel):
-    text: str
-    type: Literal["city", "street", "region", "other"]
-    lat: float | None = None
-    lon: float | None = None
+class GeoEntity(BaseModel):
+    text:        str
+    type:        Literal["region", "city", "street", "location"]
+    name:        str | None = None
     geonames_id: int | None = None
-    city_id: int | None = None
-
-
-class GeoCity(BaseModel):
-    city_id: int
-    city_name: str
-    confidence: float
-
-
-class GeoStreet(BaseModel):
-    span: str
-    edge_ids: list[int]
-    city_id: int | None = None
-
-
-class GeoPoint(BaseModel):
-    span: str
-    lat: float
-    lon: float
-    geonames_id: int | None = None
+    admin1_code: str | None = None
+    city_id:     int | None = None
+    city_name:   str | None = None
+    edge_ids:    list[int] = []
+    lat:         float | None = None
+    lon:         float | None = None
+    confidence:  float = Field(default=1.0, ge=0.0, le=1.0)
 
 
 class GeotagResponse(BaseModel):
-    article_id: str
-    geo_scope: Literal["national", "regional", "city"] | None = None
-    geo_region: str | None = None
-    geo_cities: list[GeoCity] = []
-    geo_streets: list[GeoStreet] = []
-    geo_points: list[GeoPoint] = []
-    all_places: list[PlaceMention] = []
-    # legacy — kept for backward compat with existing eval notebook
-    city: str | None = None
-    city_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    request_id: str | None = None
+    places:     list[GeoEntity]
 
 
 # --- NLI ---
