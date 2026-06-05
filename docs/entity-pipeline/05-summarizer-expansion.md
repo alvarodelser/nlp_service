@@ -4,8 +4,10 @@
 
 The existing `nlp/summarizer/` module rewrites article headlines and summaries using
 Ollama. This document covers the **additive expansion** for entity description maintenance
-— the GraphRAG-style step that refreshes a canonical entity's or edge's description as new
-evidence accumulates across documents.
+— the GraphRAG-style step that refreshes a canonical entity's description as new evidence
+accumulates across documents. (It is the *only* module that writes prose descriptions; the
+extractor and resolver just copy verbatim evidence text. Edges have no description — they
+are identified by their type, endpoints, and verbatim evidence.)
 
 The existing article summarization code is **not changed**. The only modification is a
 one-line default-argument change to `ollama_client.generate()` that is fully backward-
@@ -102,7 +104,7 @@ RULES
 - State only what the evidence explicitly supports.
 - Include key relationships, roles, and any confirmed financial or legal facts.
 - Do not speculate or add information not present in the evidence.
-- Write in English regardless of the evidence language.
+- Write the description in Spanish, regardless of the evidence language.
 ```
 
 `{evidence_list}` is formatted as a numbered list of context strings, one per document
@@ -246,7 +248,7 @@ without updating the service.
 
 1. A `"merge"` decision from the disambiguator causes a new document's mention to be
    merged into an existing canonical node → re-describe with all accumulated evidence.
-2. A new canonical node is created from a `LocalEntity` with multiple supporting chunks →
+2. A new canonical node is created from a `ResolvedEntity` with multiple supporting mentions →
    generate an initial consolidated description.
 
 The NLP service has no knowledge of when to trigger this — it only responds to calls.

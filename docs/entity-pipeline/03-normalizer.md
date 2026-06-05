@@ -1,32 +1,29 @@
-# Normalizer — Design & Implementation
+# Entity Resolver — Design & Implementation
+
+*(Formerly "the normalizer". Intra-document entity + relation resolution.)*
 
 ## Purpose
 
-Pass 2 of the document-level extraction pipeline. Operates once per document after all
-chunks have been extracted. It performs two operations in a single LLM call:
+A **stateless resolution service**: given a document's entity mentions **and the relations
+between them**, reduce the mentions to canonical entities and rewrite the relations to use those
+canonical names.
 
-1. **Intra-document entity resolution** — cluster all entity mentions from all chunks into
-   canonical local entities (`local_id`). "Musk", "Elon Musk", and "the billionaire" become
-   one cluster with canonical name "Elon Musk".
-
-2. **Edge deduplication** — when multiple chunks independently extract the same
-   `(head, relation_type, tail)` triple, merge them into a single edge, accumulating all
-   evidence spans and merging attributes (sum amounts, union dates).
-
-Relation type normalization is **not** a task of this module — canonical relation types are
-already assigned in Pass 1 via enum-constrained decoding. This module works with those
-canonical types from the start.
-
-After this module, relation endpoints are `local_id`s, not surface name strings. Cross-document
-disambiguation (mapping `local_id → canonical_id` in the graph) is a separate downstream step.
-
----
-
-## Position in pipeline
+It is intra-document by nature — the caller invokes it once per document — so there is **no
+`doc_id`** and nothing about chunks, offsets, use-case, or schema. Entities and relations
+reference each other by **name**.
 
 ```
-Chunker  →  Entity Extractor (×N chunks)  →  [Normalizer]  →  Disambiguator  →  Persistence
-                                               (per doc, Pass 2)
+  IN   entities:  [{name, type, evidence}, ...]
+       relations: [{head:name, tail:name, type, evidence, attributes}, ...]
+                       │
+                       ▼
+              ┌────────────────────┐
+              │   Entity Resolver   │  pre-merge → LLM refine → rewrite relations
+              └────────────────────┘
+                       │
+                       ▼
+  OUT  entities:  [{canonical_name, names[], type, evidence[]}, ...]   ← reduced
+       relations: [{head:canonical_name, tail:canonical_name, type, evidence[], attributes}, ...]
 ```
 
 ---
@@ -35,94 +32,99 @@ Chunker  →  Entity Extractor (×N chunks)  →  [Normalizer]  →  Disambiguat
 
 ```
 nlp/
-  normalizer/
+  resolver/
     __init__.py
-    service.py            ← orchestration: build prompt, call LLM, post-process, return
-    merger.py             ← pure-Python edge merging logic (no LLM)
+    service.py        ← pre-merge, LLM refine, rewrite relations, return
+    premerge.py       ← pure-Python exact-name (or embedding) blocking
+    edges.py          ← pure-Python relation rewrite + overlap collapse (no LLM)
     prompts/
-      resolution.txt      ← system prompt for entity clustering
-    ollama_client.py      ← calls /api/chat with resolution schema
+      resolution.txt  ← the refine prompt
+    ollama_client.py  ← /api/chat with the cluster schema
 
 api/
   routers/
-    normalize.py          ← POST /normalize
+    resolve.py        ← POST /resolve
 ```
 
 ---
 
 ## Data contracts
 
-### Request — `POST /normalize`
+### Input — `POST /resolve`
 
 ```python
-class ChunkExtraction(BaseModel):
-    chunk_id:   str
-    char_start: int
-    char_end:   int
-    entities:   list[ExtractedEntity]    # from EntityExtractResponse
-    relations:  list[ExtractedRelation]  # from EntityExtractResponse
+class EntityIn(BaseModel):
+    name:     str            # the surface name as extracted ("Laura Méndez", "Méndez", "la ministra")
+    type:     str
+    subtype:  str | None = None
+    evidence: str            # the sentence the mention appeared in
 
-class NormalizeRequest(BaseModel):
-    doc_id:   str
-    use_case: str
-    chunks:   list[ChunkExtraction]      # all chunks for this document, ordered
-```
-
-### Response — `NormalizeResponse`
-
-```python
-class EntityMention(BaseModel):
-    text:       str     # surface form as extracted
-    chunk_id:   str
-    char_start: int     # absolute offset (chunk.char_start + span.start)
-    char_end:   int     # absolute offset (chunk.char_start + span.end)
+class RelationIn(BaseModel):
+    head:       str          # subject entity name
+    tail:       str          # object entity name
+    type:       str
+    subtype:    str | None = None
+    evidence:   str          # the clause stating the relation
+    attributes: dict
     confidence: float
 
-class LocalEntity(BaseModel):
-    local_id:       str             # e.g. "e001", scoped to this document
-    canonical_name: str
+class ResolveRequest(BaseModel):
+    entities:  list[EntityIn]
+    relations: list[RelationIn]
+```
+
+No `doc_id`, no ids, no offsets. Relations point at entities by name; the service maps each name
+to its canonical entity. (The orchestrator produces this by flattening the chunks' extractions
+and converting the extractor's relation indices into the endpoint entity's name.)
+
+### Output — `ResolveResponse`
+
+```python
+class ResolvedEntity(BaseModel):
+    canonical_name: str            # the chosen name for the reduced entity
+    names:          list[str]      # every surface name merged into it (its aliases)
     type:           str
     subtype:        str | None
-    description:    str             # synthesised from all mention descriptions
-    mentions:       list[EntityMention]
+    evidence:       list[str]      # every member's evidence sentence, collected
 
-class MergedEdge(BaseModel):
-    head_local_id:  str
-    relation:       str             # canonical type from ontology
-    tail_local_id:  str
-    description:    str             # synthesised from all relation descriptions
-    attributes:     RelationAttributes   # merged (see rules below)
-    evidence:       list[EvidenceSpan]   # one per source chunk
+class ResolvedRelation(BaseModel):
+    head:       str                # a canonical_name
+    tail:       str                # a canonical_name
+    type:       str
+    subtype:    str | None
+    evidence:   list[str]          # collected; >1 only when overlap duplicates collapsed
+    attributes: dict               # passed through, never aggregated
+    confidence: float              # max across collapsed duplicates
 
-class EvidenceSpan(BaseModel):
-    chunk_id:   str
-    char_start: int     # absolute
-    char_end:   int
-    text:       str     # the evidence sentence(s)
-
-class NormalizeResponse(BaseModel):
-    doc_id:           str
-    local_entities:   list[LocalEntity]
-    edges:            list[MergedEdge]
+class ResolveResponse(BaseModel):
+    entities:  list[ResolvedEntity]
+    relations: list[ResolvedRelation]
 ```
+
+The reduced entity keeps both its `canonical_name` and the `names` it absorbed, so the caller
+can match anything back. Relations now read in canonical names end to end.
 
 ---
 
 ## Algorithm
 
-### Step 1 — Flatten all mentions across chunks
+### Step 1 — Pre-merge entities (pure Python, no LLM)
 
-Collect every `ExtractedEntity` from every chunk into a flat list. Each entry retains its
-`chunk_id` and absolute offset (computed by adding `chunk.char_start` to the entity's
-relative span). This is pure Python, no LLM.
+Normalize each entity's name (lowercase; strip honorifics, punctuation, legal suffixes like
+"S.A." / "Ltd") and group entities that share a normalized name **and** type into one
+**candidate**. Most entries are literal repeats ("Laura Méndez" / "Méndez" 20×), so this
+collapses a long list into a handful of candidates, each keeping its member names, a provisional
+canonical name (most complete form), and one representative evidence sentence.
 
-### Step 2 — Entity clustering (LLM call)
+> Optionally block by `bge-m3` embedding similarity instead of exact form, to catch spelling
+> variants ("Banco Santander" / "Santander S.A."). Reuses the disambiguator's encoder (04).
 
-Build the resolution prompt: include the flat entity list with types, descriptions, and a
-representative context sentence (the text surrounding the span). Ask the LLM to assign a
-`cluster_id` to each mention.
+### Step 2 — LLM refine (the only LLM call)
 
-The LLM output schema is intentionally minimal to keep constrained decoding fast:
+Send the **candidates** (not the raw entities) to the LLM, each with its provisional name, type,
+and representative evidence. It does only what pre-merge cannot: merge a definite description or
+pronoun mention into a named candidate, and split same-named different entities when their
+evidence diverges. It references candidates by integer index.
 
 ```jsonc
 {
@@ -133,15 +135,13 @@ The LLM output schema is intentionally minimal to keep constrained decoding fast
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["cluster_id", "canonical_name", "type", "subtype", "description", "mention_indices"],
+        "required": ["canonical_name", "type", "subtype", "candidate_indices"],
         "additionalProperties": false,
         "properties": {
-          "cluster_id":     {"type": "string"},
-          "canonical_name": {"type": "string"},
-          "type":           {"enum": [...]},
-          "subtype":        {"oneOf": [{"enum": [...]}, {"type": "null"}]},
-          "description":    {"type": "string"},
-          "mention_indices":{"type": "array", "items": {"type": "integer"}}
+          "canonical_name":    {"type": "string"},
+          "type":              {"type": "string"},
+          "subtype":           {"oneOf": [{"type": "string"}, {"type": "null"}]},
+          "candidate_indices": {"type": "array", "items": {"type": "integer"}}
         }
       }
     }
@@ -149,70 +149,53 @@ The LLM output schema is intentionally minimal to keep constrained decoding fast
 }
 ```
 
-`mention_indices` references positions in the flat mention list passed in the prompt. This
-avoids asking the LLM to repeat name strings (error-prone) — it uses integer indices instead.
+**Skip the LLM entirely** when pre-merge yields all unique-named singletons. If candidates
+exceed `RESOLVE_CANDIDATE_BATCH`, refine per type then merge across types only where names
+match. The LLM input scales with *candidate* count, not entity count — so it stays small even
+for very long inputs.
 
-**Context window management:** If the flat mention list exceeds ~80 entities (uncommon for
-journalism documents), split into batches by type and run multiple clustering calls, then
-merge clusters that share identical canonical names across batches.
+### Step 3 — Build reduced entities + the name map (pure Python)
 
-### Step 3 — Build `LocalEntity` objects (pure Python)
+For each refined cluster, emit a `ResolvedEntity` (canonical_name, all member `names`, type,
+collected `evidence`). Build `name → canonical_name` from the members — the lookup Step 4 uses.
 
-For each cluster returned by the LLM:
-- Assign `local_id = f"e{i:03d}"` (stable within this document)
-- Collect all `EntityMention` objects using `mention_indices`
-- Use the LLM-provided `description` as the entity description (it has seen all mentions)
+### Step 4 — Rewrite and de-duplicate relations (pure Python, `edges.py`)
 
-Validate that every input mention appears in exactly one cluster. Unclustered mentions (LLM
-omission) are logged at WARNING and added as singleton clusters.
+Deterministic, no LLM:
 
-### Step 4 — Edge deduplication (pure Python, `merger.py`)
-
-The LLM is not involved in edge deduplication. This is deterministic:
-
-1. **Endpoint resolution:** Replace each relation's `head`/`tail` name string with a
-   `local_id` by matching against `EntityMention.text` for each cluster.
-
-   - Exact match first; if no match, normalise (lowercase, strip punctuation) and retry.
-   - If still no match, log WARNING and set `head_local_id = null` (edge is kept but
-     flagged for review).
-
-2. **Group by `(head_local_id, relation, tail_local_id)`.**
-
-3. **Merge attributes** per relation type rules:
-   - `amount`: sum all non-null values (multiple payments in same document)
-   - `currency`: use the value if unanimous; `"MIXED"` otherwise
-   - `date`: collect as a sorted list, expose as `date_range: [min, max]`
-   - `direction`: unanimous value; `"MIXED"` otherwise
-
-4. **Merge descriptions:** concatenate with `" | "` separator. The summarizer's
-   `describe_entity` can refresh this later as evidence accumulates.
-
-5. **Collect evidence spans:** one per source relation, converted to absolute offsets.
+1. **Rewrite endpoints:** map each relation's `head`/`tail` name to its `canonical_name` via the
+   Step 3 map. A name in no cluster → log WARNING, drop the relation.
+2. **Collapse overlap duplicates:** group by `(head, type, tail, evidence_fingerprint)`;
+   relations with the same canonical endpoints **and** overlapping evidence (≥ 80 %, the same
+   sentence from two overlapping chunks) collapse into one — keeping both evidence snippets,
+   `confidence` = max, attributes from the highest-confidence instance.
+3. **Distinct evidence = distinct relations.** Two payments between the same parties are two
+   payments. Attributes are **never** aggregated.
 
 ---
 
 ## Prompt template (`resolution.txt`)
 
 ```
-You are resolving entity mentions to canonical identities within a single document.
-You will receive a numbered list of entity mentions with their types and descriptions.
-Group mentions that refer to the same real-world entity into clusters.
+You are resolving entities to canonical identities.
+You will receive a numbered list of CANDIDATE entities (already pre-merged from exact-name
+matches), each with a provisional name, type, and one example sentence (evidence). Merge the
+candidates that refer to the same real-world entity into clusters.
 
 RULES
 =====
-- Assign every mention to exactly one cluster.
-- Choose the most complete, unambiguous name as canonical_name (full name over nickname,
-  legal name over alias).
-- Keep type and subtype consistent within a cluster; if a mention was wrongly typed, use
-  the majority type.
-- Write a single-sentence description that covers all mentions in the cluster.
-- Only cluster mentions of the same broad type (do not merge a PERSON into an ORGANIZATION).
-- Use the integer index from the list (0-based) in mention_indices.
+- Every candidate goes into exactly one cluster (a candidate alone forms a singleton).
+- Merge a candidate into another only when the evidence makes it the SAME entity — e.g. a
+  definite description ("the minister") or pronoun mention matching a named candidate.
+- Split candidates that share a name but are clearly different entities by their evidence.
+- Choose the most complete, unambiguous name as canonical_name. Preserve original language/spelling.
+- Only cluster candidates of the same type.
+- Reference candidates by their integer index (0-based) in candidate_indices.
+- Do NOT write a description — that is produced later.
 
-MENTIONS
-========
-{mention_list}
+CANDIDATES
+==========
+{candidate_list}
 ```
 
 ---
@@ -221,11 +204,13 @@ MENTIONS
 
 | Situation | Handling |
 |---|---|
-| Document has only one chunk | Skip LLM call if fewer than 2 distinct entity names across the chunk. Return a trivial 1:1 cluster per entity. |
-| LLM assigns same `cluster_id` to two different real entities | Post-check: if two mentions in a cluster have incompatible types, split and log ERROR. |
-| Relation head or tail names a mention not in any cluster | Log WARNING, mark edge with `unresolved=true`; persist for review. |
-| Attribute conflict (e.g. two different amounts for PAYMENT_TO) | Sum them; include both raw values in `evidence`. |
-| Empty document (zero chunks) | Return empty `local_entities` and `edges`; no LLM call. |
+| Pre-merge yields all unique-named singletons | Skip the LLM refine call entirely. |
+| LLM merges two candidates of incompatible types | Post-check: if a cluster mixes types, split it and log ERROR. |
+| Same name, genuinely different entities | The refine step splits them by evidence → two `ResolvedEntity` with **the same `canonical_name`**. Relations referencing that bare name are then ambiguous — log WARNING and attach to the more frequent one. (The only case a name can't disambiguate; rare intra-doc.) |
+| Relation endpoint name not in any entity | Log WARNING, drop the relation. |
+| Same `(head, type, tail)` + overlapping evidence | Collapse into one relation; keep both evidence; `confidence` = max; attributes from the higher-confidence instance. |
+| Same `(head, type, tail)` + different evidence | Keep separate — distinct instances. |
+| Empty `entities` and `relations` | Return both empty; no LLM call. |
 
 ---
 
@@ -233,24 +218,26 @@ MENTIONS
 
 | Env var | Default | Description |
 |---|---|---|
-| `NORMALIZATION_MODEL` | `qwen2.5:32b` | Ollama model for entity clustering |
-| `NORMALIZATION_TIMEOUT` | `180` | Seconds per Ollama call |
-| `NORMALIZATION_ENTITY_BATCH` | `80` | Max mentions per clustering call before batching |
+| `RESOLVE_MODEL` | `qwen2.5:32b` | Ollama model for the refine call |
+| `RESOLVE_TIMEOUT` | `180` | Seconds per Ollama call |
+| `RESOLVE_CANDIDATE_BATCH` | `80` | Max candidates per refine call before batching |
 | `OLLAMA_HOST` | `http://ollama:11434` | Shared |
 
 ---
 
 ## Testing
 
-See [06-testing.md](06-testing.md) §2 — `merger.py` is fully unit-testable (no LLM);
-LLM clustering is tested with a mocked Ollama response. Key cases: amount summing,
-mixed currency, unresolved endpoints.
+See [06-testing.md](06-testing.md) §2 — `premerge.py` and `edges.py` are fully unit-testable
+(no LLM); the LLM refine is tested with a mocked Ollama response. Key cases: pre-merge collapses
+exact-name repeats, refine merges a definite-description candidate, refine splits same-name
+different entities, all-singletons skips the LLM, relation rewrite maps names to canonical,
+overlap collapse, distinct evidence stays separate, dangling endpoint dropped.
 
 ---
 
 ## Dependencies
 
-- `nlp/schema.py` — for entity and relation type enums in schema
 - Ollama sidecar
+- `bge-m3` encoder (only if pre-merge blocks by embedding similarity; reuses 04's)
 - `httpx` — already in requirements.txt
 - No new packages

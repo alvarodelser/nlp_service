@@ -9,14 +9,14 @@ model. Tests are split accordingly.
 
 ```
 Unit tests (no network, no model)
-  nlp/schema.py          ← YAML loading, validation, schema emission, system prompt
-  nlp/normalizer/merger.py  ← edge dedup, attribute merging, endpoint resolution
-  nlp/dedup/disambiguator.py  ← scoring, alias bonus, three-tier decision
+  nlp/schema.py          ← YAML loading, validation, schema emission, system prompt, Weaviate spec
+  nlp/resolver/premerge.py + edges.py  ← pre-merge, relation rewrite by name, overlap collapse
+  nlp/dedup/disambiguator.py  ← vector + subtype scoring, three-tier decision
   nlp/entity_extractor/service.py (validation logic)  ← post-extraction checks
 
 Integration tests (mock Ollama via httpx)
   nlp/entity_extractor/service.py  ← full run() with canned LLM response
-  nlp/normalizer/service.py        ← clustering call with canned LLM response
+  nlp/resolver/service.py          ← refine call with canned LLM response
   nlp/summarizer/service.py        ← describe_entity() with canned LLM response
 
 Eval notebooks (human-reviewed, not in CI)
@@ -79,22 +79,15 @@ tests/fixtures/schemas/
 ### Key test cases
 
 ```python
-def test_entity_type_names_includes_novel():
+def test_entity_types_are_closed_world():
     s = load_schema("valid_financial_flows.yaml")
-    assert "__NOVEL__" in s.entity_type_names()
+    names = s.entity_type_names()
+    assert "PERSON" in names and "ORGANIZATION" in names
+    assert "__NOVEL__" not in names          # closed-world: no escape hatch
 
-def test_relation_type_names_includes_unclassified():
+def test_relation_types_are_closed_world():
     s = load_schema("valid_financial_flows.yaml")
-    assert "__UNCLASSIFIED__" in s.relation_type_names()
-
-def test_required_entity_attrs():
-    s = load_schema("valid_financial_flows.yaml")
-    # financial_flows has no required entity attrs — all optional
-    assert s.required_entity_attrs("PERSON") == []
-
-def test_required_relation_attrs():
-    s = load_schema("valid_financial_flows.yaml")
-    assert set(s.required_relation_attrs("PAYMENT_TO")) == {"amount", "currency"}
+    assert "__UNCLASSIFIED__" not in s.relation_type_names()
 
 def test_all_entity_attribute_keys_is_union():
     s = load_schema("valid_financial_flows.yaml")
@@ -103,19 +96,26 @@ def test_all_entity_attribute_keys_is_union():
     assert "jurisdiction" in keys      # ORGANIZATION
     assert "account_type" in keys      # FINANCIAL_ENTITY
 
-def test_extraction_schema_entity_has_attributes():
+def test_to_extraction_schema_projection():
+    # 01 projects the rich YAML down to the slim ExtractionSchema the extractor consumes
     s = load_schema("valid_financial_flows.yaml")
-    schema = s.extraction_schema()
-    entity_props = schema["properties"]["entities"]["items"]["properties"]
-    assert "attributes" in entity_props
-    assert "jurisdiction" in entity_props["attributes"]["properties"]
+    es = s.to_extraction_schema()
+    person = next(t for t in es.entity_types if t.name == "PERSON")
+    assert {st.name for st in person.subtypes} == {"POLITICIAN", "EXECUTIVE", "INTERMEDIARY"}
+    assert {a.name for a in person.attributes} == {"nationality", "role_title", "date_of_birth"}
+    assert {a.datatype for a in person.attributes} == {"string"}
+    payment = next(t for t in es.relation_types if t.name == "PAYMENT_TO")
+    assert "PERSON" in payment.head_types and "ORGANIZATION" in payment.tail_types
+    # visual / required / version are dropped in the projection — not the extractor's concern
+    assert not hasattr(person, "visual")
 
-def test_system_prompt_contains_required_marker():
+def test_weaviate_spec_includes_attribute_columns():
+    # every declared entity attribute gets a property so it has somewhere to land at upsert
     s = load_schema("valid_financial_flows.yaml")
-    prompt = s.system_prompt()
-    assert "REQUIRED" in prompt
-    assert "amount" in prompt
-    assert "currency" in prompt
+    props = {p["name"]: p["dataType"] for p in s.weaviate_collection_spec()["properties"]}
+    assert {"canonical_name", "type", "description", "aliases", "doc_ids"} <= props.keys()
+    assert "jurisdiction" in props and "nationality" in props   # from the schema attributes
+    assert props["jurisdiction"] == ["text"]                    # string → text
 
 def test_validation_rejects_unknown_head_type():
     with pytest.raises(ValueError, match="head_type"):
@@ -134,68 +134,61 @@ def test_weaviate_spec_name_includes_version():
 
 ---
 
-## 2. Edge merger (`nlp/normalizer/merger.py`)
+## 2. Resolver (`nlp/resolver/`)
 
-Pure Python. Tests live in `tests/test_normalizer_merger.py`.
+`premerge.py` and `edges.py` are pure Python (no LLM); the LLM refine is mocked. Tests live in
+`tests/test_resolver.py`.
 
 ### Key test cases
 
 ```python
-# helpers
-def make_relation(head_id, rel_type, tail_id, **attrs):
-    return ExtractedRelation(
-        head_local_id=head_id, relation=rel_type, tail_local_id=tail_id,
-        description="test", evidence_span={"start": 0, "end": 10},
-        attributes=RelationAttributes(**attrs), confidence=0.9,
-    )
+# --- pre-merge (premerge.py): exact-name grouping ---
 
-def test_identical_triples_merge_to_one():
-    edges = [make_relation("e1", "PAYMENT_TO", "e2", amount=100.0, currency="EUR"),
-             make_relation("e1", "PAYMENT_TO", "e2", amount=100.0, currency="EUR")]
-    assert len(merge_edges(edges)) == 1
+def test_premerge_collapses_exact_name_repeats():
+    ents = [EntityIn(name="Laura Méndez", type="PERSON", evidence="..."),
+            EntityIn(name="Laura Méndez", type="PERSON", evidence="..."),
+            EntityIn(name="Méndez",       type="PERSON", evidence="...")]
+    cands = premerge(ents)
+    assert len(cands) == 2          # the two "Laura Méndez" collapse; "Méndez" awaits refine
 
-def test_amounts_sum_on_dedup():
-    edges = [make_relation("e1", "PAYMENT_TO", "e2", amount=100.0, currency="EUR"),
-             make_relation("e1", "PAYMENT_TO", "e2", amount=50.0,  currency="EUR")]
-    merged = merge_edges(edges)
-    assert merged[0].attributes.amount == 150.0
+def test_premerge_never_merges_across_types():
+    ents = [EntityIn(name="Delta", type="ORGANIZATION", evidence="..."),
+            EntityIn(name="Delta", type="PERSON", evidence="...")]
+    assert len(premerge(ents)) == 2
 
-def test_mixed_currency_flagged():
-    edges = [make_relation("e1", "PAYMENT_TO", "e2", amount=100.0, currency="EUR"),
-             make_relation("e1", "PAYMENT_TO", "e2", amount=50.0,  currency="USD")]
-    merged = merge_edges(edges)
-    assert merged[0].attributes.currency == "MIXED"
+# --- relation rewrite + overlap collapse (edges.py), given a name→canonical map ---
 
-def test_evidence_spans_accumulated():
-    edges = [make_relation("e1", "OWNS", "e2"),
-             make_relation("e1", "OWNS", "e2")]
-    merged = merge_edges(edges)
-    assert len(merged[0].evidence) == 2
+NAME2CANON = {"Méndez": "Laura Méndez", "Laura Méndez": "Laura Méndez", "Delta": "Delta S.A."}
 
-def test_distinct_triples_not_merged():
-    edges = [make_relation("e1", "PAYMENT_TO", "e2", amount=100.0, currency="EUR"),
-             make_relation("e1", "PAYMENT_TO", "e3", amount=50.0,  currency="EUR")]
-    assert len(merge_edges(edges)) == 2
+def make_rel(head, tail, rel="PAYMENT_TO", evidence="pagó 100 EUR", conf=0.9, **attrs):
+    return RelationIn(head=head, tail=tail, type=rel, evidence=evidence,
+                      attributes=attrs, confidence=conf)
 
-def test_endpoint_resolution_exact_match():
-    # "Acme Holdings" in cluster → gets local_id "e1"
-    clusters = [LocalEntity(local_id="e1", mentions=[EntityMention(text="Acme Holdings", ...)])]
-    relations = [ExtractedRelation(head="Acme Holdings", tail="Musk", ...)]
-    resolved = resolve_endpoints(relations, clusters)
-    assert resolved[0].head_local_id == "e1"
+def test_rewrite_maps_endpoints_to_canonical():
+    out = resolve_relations([make_rel("Méndez", "Delta")], NAME2CANON)
+    assert (out[0].head, out[0].tail) == ("Laura Méndez", "Delta S.A.")
 
-def test_endpoint_resolution_normalised_match():
-    # "acme holdings" (lowercased) matches cluster with "Acme Holdings"
-    clusters = [LocalEntity(local_id="e1", mentions=[EntityMention(text="Acme Holdings", ...)])]
-    relations = [ExtractedRelation(head="acme holdings", tail="Musk", ...)]
-    resolved = resolve_endpoints(relations, clusters)
-    assert resolved[0].head_local_id == "e1"
+def test_dangling_endpoint_dropped():
+    assert resolve_relations([make_rel("Desconocido", "Delta")], NAME2CANON) == []
 
-def test_unresolved_endpoint_flagged():
-    clusters = []
-    relations = [ExtractedRelation(head="Unknown Entity", tail="B", ...)]
-    resolved = resolve_endpoints(relations, clusters)
-    assert resolved[0].head_local_id is None
+def test_overlapping_duplicates_collapse_to_one():
+    # same canonical endpoints + same evidence (two overlapping chunks) → one relation
+    rels = [make_rel("Méndez", "Delta", evidence="pagó 100 EUR"),
+            make_rel("Laura Méndez", "Delta", evidence="pagó 100 EUR")]
+    out = resolve_relations(rels, NAME2CANON)
+    assert len(out) == 1 and len(out[0].evidence) == 2
+
+def test_distinct_instances_not_merged():
+    rels = [make_rel("Méndez", "Delta", evidence="pagó 100 EUR en marzo"),
+            make_rel("Méndez", "Delta", evidence="pagó 50 EUR en mayo")]
+    assert len(resolve_relations(rels, NAME2CANON)) == 2
+
+def test_attributes_pass_through_and_max_confidence():
+    rels = [make_rel("Méndez", "Delta", evidence="es dueño", conf=0.7, stake_pct=10),
+            make_rel("Méndez", "Delta", evidence="es dueño", conf=0.9, stake_pct=12)]
+    out = resolve_relations(rels, NAME2CANON)[0]
+    assert out.attributes["stake_pct"] == 12   # higher-confidence instance; never aggregated
+    assert out.confidence == 0.9               # max of collapsed duplicates
 ```
 
 ---
@@ -208,13 +201,13 @@ Pure logic — candidates are passed in, no Weaviate or LLM dependency in the co
 ### Key test cases
 
 ```python
-def make_candidate(score, name="Acme", aliases=None, subtype=None):
+def make_candidate(score, name="Acme", subtype=None):
     return Candidate(canonical_id="c1", canonical_name=name, type="ORGANIZATION",
-                     subtype=subtype, description="", aliases=aliases or [], score=score)
+                     subtype=subtype, description="", score=score)
 
-def make_entity(name="Acme Holdings", subtype=None):
-    return LocalEntity(local_id="e1", canonical_name=name, type="ORGANIZATION",
-                       subtype=subtype, description="", mentions=[])
+def make_entity(name="Delta S.A.", subtype=None):
+    return ResolvedEntity(canonical_name=name, names=[name], type="ORGANIZATION",
+                          subtype=subtype, evidence=[])
 
 def test_auto_merge_above_threshold():
     result = disambiguate(make_entity(), [1.0], [make_candidate(0.95)],
@@ -232,19 +225,6 @@ def test_auto_create_no_candidates():
     result = disambiguate(make_entity(), [1.0], [],
                           merge_threshold=0.92, review_low=0.75, llm_adjudicate=False)
     assert result.decision == "create"
-
-def test_alias_bonus_can_reach_merge_threshold():
-    # score=0.80 normally → review; alias match adds +0.15 → 0.95 → merge
-    candidate = make_candidate(0.80, name="Acme Holdings", aliases=["Acme Holdings"])
-    result = disambiguate(make_entity("Acme Holdings"), [1.0], [candidate],
-                          merge_threshold=0.92, review_low=0.75, llm_adjudicate=False)
-    assert result.decision == "merge"
-
-def test_alias_bonus_capped_at_one():
-    candidate = make_candidate(0.98, aliases=["Acme Holdings"])
-    result = disambiguate(make_entity("Acme Holdings"), [1.0], [candidate],
-                          merge_threshold=0.92, review_low=0.75, llm_adjudicate=False)
-    assert result.confidence <= 1.0
 
 def test_subtype_mismatch_penalty():
     candidate = make_candidate(0.93, subtype="BANK")
@@ -279,66 +259,84 @@ def test_llm_error_returns_review(mock_ollama_raises):
 
 ---
 
-## 4. Entity extractor post-validation (`nlp/entity_extractor/service.py`)
+## 4. Entity extractor (`nlp/entity_extractor/`)
 
-The LLM call is mocked; the validation logic after it is what's under test.
-Tests live in `tests/test_entity_extractor.py`.
+Stateless: `run(text, schema)`. Two pure-Python concerns (compile the schema; check the one
+relational rule) plus one mocked-Ollama run. Tests live in `tests/test_entity_extractor.py`.
 
-### Key test cases
+### 4a. Schema compiler (pure, no LLM)
 
 ```python
-CANNED_EXTRACTION = {
-    "entities": [{
-        "name": "María García", "type": "PERSON", "subtype": "POLITICIAN",
-        "description": "Minister of Finance",
-        "span": {"start": 5, "end": 17},
-        "attributes": {"role_title": "Minister of Finance", "nationality": None, ...},
-        "confidence": 0.95
-    }],
-    "relations": [{
-        "head": "María García", "relation": "PAYMENT_TO", "tail": "Acme Holdings",
-        "description": "wired €4.2M",
-        "evidence_span": {"start": 5, "end": 80},
-        "attributes": {"amount": 4200000.0, "currency": "EUR", "date": None, "direction": None, ...},
-        "confidence": 0.88
-    }]
+def test_compiler_builds_discriminated_union(extraction_schema):
+    grammar, prompt = compile_schema(extraction_schema)   # ExtractionSchema → (grammar, prompt)
+    # reasoning scratchpad is the first property (no-CoT workaround)
+    assert grammar["properties"]["reasoning"]["type"] == "string"
+    # one entity branch per type, each scoping ONLY its own attributes
+    branches = grammar["properties"]["entities"]["items"]["oneOf"]
+    by_type = {b["properties"]["type"]["const"]: b for b in branches}
+    person_attrs = by_type["PERSON"]["properties"]["attributes"]["properties"]
+    assert "nationality" in person_attrs         # PERSON owns this
+    assert "jurisdiction" not in person_attrs     # ...and is NOT shown ORGANIZATION's attrs
+    # relation endpoints are integer indices; the type catalogue is injected into the prompt
+    pay = next(b for b in grammar["properties"]["relations"]["items"]["oneOf"]
+               if b["properties"]["type"]["const"] == "PAYMENT_TO")
+    assert pay["properties"]["head"]["type"] == "integer"
+    assert "PERSON" in prompt
+```
+
+(subtype/attribute/datatype validity is *not* tested post-hoc — the grammar guarantees it at
+generation, so there is nothing to check.)
+
+### 4b. The one runtime rule: relation subject/object types
+
+```python
+SCHEMA = ...  # ExtractionSchema; PAYMENT_TO.head_types = PAYMENT_TO.tail_types = [PERSON, ORGANIZATION]
+
+CANNED = {
+    "reasoning": "Una ministra y una sociedad, con un pago entre ambas.",
+    "entities": [
+        {"name": "Laura Méndez", "mention_text": "Laura Méndez", "type": "PERSON",
+         "subtype": "POLITICIAN",
+         "evidence_text": "La ministra Laura Méndez transfirió 4,2 millones de euros a Delta S.A.",
+         "attributes": {"role_title": "Ministra de Finanzas"}, "confidence": 0.95},
+        {"name": "Delta S.A.", "mention_text": "Delta S.A.", "type": "ORGANIZATION",
+         "subtype": None,
+         "evidence_text": "La ministra Laura Méndez transfirió 4,2 millones de euros a Delta S.A.",
+         "attributes": {}, "confidence": 0.9},
+    ],
+    "relations": [
+        {"head": 0, "type": "PAYMENT_TO", "tail": 1, "subtype": None,
+         "evidence_text": "Laura Méndez transfirió 4,2 millones de euros a Delta S.A.",
+         "attributes": {"amount": 4200000.0, "currency": "EUR"}, "confidence": 0.88},
+    ],
 }
 
-@pytest.mark.parametrize("mock_ollama_extract", [CANNED_EXTRACTION], indirect=True)
-def test_successful_extraction_returns_entities(mock_ollama_extract, schema):
-    req = EntityExtractRequest(doc_id="d1", chunk_id="d1_000", text="...",
-                               char_start=0, char_end=200, use_case="financial_flows")
-    resp = service.run(req, schema)
-    assert len(resp.entities) == 1
-    assert resp.entities[0].name == "María García"
+@pytest.mark.parametrize("mock_ollama", [CANNED], indirect=True)
+def test_valid_extraction_passes_through(mock_ollama):
+    resp = service.run(text="...", schema=SCHEMA)
+    assert len(resp.entities) == 2
+    assert resp.relations[0].type == "PAYMENT_TO"
+    assert (resp.relations[0].head, resp.relations[0].tail) == (0, 1)
 
-def test_span_beyond_text_is_clamped(mock_ollama_extract, schema):
-    # entity span.end > len(text) → clamped, confidence unchanged
-    payload = deep_copy(CANNED_EXTRACTION)
-    payload["entities"][0]["span"]["end"] = 9999
-    # inject payload, run, assert span clamped to len(text)
+def test_out_of_range_endpoint_dropped():
+    payload = deep_copy(CANNED); payload["relations"][0]["head"] = 7   # only 0 and 1 exist
+    resp = service.run_with_payload(payload, SCHEMA)
+    assert resp.relations == []
 
-def test_inverted_span_zeroes_confidence(mock_ollama_extract, schema):
-    payload = deep_copy(CANNED_EXTRACTION)
-    payload["entities"][0]["span"] = {"start": 50, "end": 10}
-    resp = service.run_with_payload(payload, schema, chunk_text="...")
-    assert resp.entities[0].confidence == 0.0
+def test_type_incompatible_relation_dropped():
+    # object becomes a LOCATION, but PAYMENT_TO.tail_types = [PERSON, ORGANIZATION]
+    payload = deep_copy(CANNED)
+    payload["entities"][1]["type"] = "LOCATION"; payload["entities"][1]["subtype"] = None
+    resp = service.run_with_payload(payload, SCHEMA)
+    assert resp.relations == []
 
-def test_missing_required_relation_attr_penalises_confidence(schema):
-    payload = deep_copy(CANNED_EXTRACTION)
-    payload["relations"][0]["attributes"]["amount"]   = None
-    payload["relations"][0]["attributes"]["currency"] = None
-    resp = service.run_with_payload(payload, schema, chunk_text="...")
-    assert resp.relations[0].confidence == pytest.approx(0.88 * 0.6)
-
-def test_subtype_mismatch_nulled(schema):
-    payload = deep_copy(CANNED_EXTRACTION)
-    payload["entities"][0]["subtype"] = "BANK"   # BANK is not a PERSON subtype
-    resp = service.run_with_payload(payload, schema, chunk_text="...")
-    assert resp.entities[0].subtype is None
+def test_entities_are_never_dropped():
+    payload = deep_copy(CANNED); payload["relations"][0]["head"] = 7
+    resp = service.run_with_payload(payload, SCHEMA)
+    assert len(resp.entities) == 2     # only the bad relation is dropped
 
 def test_ollama_unavailable_raises_503(client, mock_ollama_raises):
-    response = client.post("/entity-extract", json={...})
+    response = client.post("/entity-extract", json={"text": "...", "schema": {...}})
     assert response.status_code == 503
 ```
 
@@ -350,13 +348,13 @@ Append to `tests/test_summarize.py` (existing file). Tests reuse the existing
 `mock_ollama_extract` fixture pattern.
 
 ```python
-CANNED_DESCRIPTION = {"description": "Acme Holdings is a Delaware-registered shell company..."}
+CANNED_DESCRIPTION = {"description": "Delta S.A. es una sociedad pantalla registrada en Delaware..."}
 
 @pytest.mark.parametrize("mock_ollama_extract", [CANNED_DESCRIPTION], indirect=True)
 def test_describe_entity_returns_description(mock_ollama_extract):
     result = service.describe_entity(
-        name="Acme Holdings", entity_type="ORGANIZATION", subtype="SHELL_COMPANY",
-        evidence=["[doc_id: abc, 2024-03] Acme Holdings received €4.2M..."]
+        name="Delta S.A.", entity_type="ORGANIZATION", subtype="SHELL_COMPANY",
+        evidence=["[doc_id: abc, 2024-03] Delta S.A. recibió 4,2 M€ de la ministra..."]
     )
     assert "description" in result
     assert len(result["description"]) > 0
@@ -411,10 +409,13 @@ eval/fixtures/
 }
 ```
 
-Eval notebooks score precision/recall of entities and relations against these fixtures,
-matching on `(name, type)` for entities and `(head, relation, tail)` for relations. Attribute
-scoring uses a separate per-attribute exact-match check so you can see which attributes the
-LLM struggles to fill.
+Gold relations are authored by entity **name** for readability. Because the model now emits
+`head`/`tail` as integer indices into its `entities` array, the eval harness first resolves
+each predicted index back to that entity's `name`, then scores. Eval notebooks score
+precision/recall of entities and relations against these fixtures, matching on `(name, type)`
+for entities and `(head_name, relation, tail_name)` for relations. Attribute scoring uses a
+separate per-attribute exact-match check so you can see which attributes the LLM struggles to
+fill.
 
 ---
 
@@ -422,7 +423,7 @@ LLM struggles to fill.
 
 ```bash
 # Unit + integration (mocked Ollama) — fast, runs in CI
-pytest tests/test_schema.py tests/test_normalizer_merger.py tests/test_disambiguator.py tests/test_entity_extractor.py -v
+pytest tests/test_schema.py tests/test_resolver.py tests/test_disambiguator.py tests/test_entity_extractor.py -v
 
 # Full test suite including existing modules
 pytest -v

@@ -4,7 +4,7 @@
 
 The existing `nlp/dedup/` module performs article-level duplicate detection using MinHash
 LSH + FAISS. This document covers the **additive expansion** for cross-document entity
-disambiguation — mapping a local entity (produced by the Normalizer) to a canonical node
+disambiguation — mapping a resolved entity (produced by the resolver, 03) to a canonical node
 that already exists in the graph, or deciding that a new node should be created.
 
 The existing article dedup code is **not changed**. Every existing function, class, and
@@ -54,8 +54,8 @@ api/
 
 ### The problem
 
-After the Normalizer produces `LocalEntity` objects (canonical within one document), we
-need to answer: does "Acme Holdings Ltd" in document 42 refer to the same node as "Acme
+After the resolver (03) produces `ResolvedEntity` objects (canonical within one document), we
+need to answer: does "Delta Holdings Ltd" in document 42 refer to the same node as "Delta
 Holdings" already in the graph from document 7? The answer determines whether to MERGE
 into the existing node, CREATE a new one, or route to human REVIEW.
 
@@ -66,8 +66,8 @@ Query Weaviate for top-K candidates filtered by entity type
          │
          ▼
   Score each candidate:
-    - vector cosine similarity (name + description embedding)
-    - alias exact match bonus (+0.15 if name in candidate.aliases)
+    - vector cosine similarity (canonical_name + evidence embedding — there is no
+      description yet; the summarizer writes that only after merge/create)
     - type match (already filtered, but subtype mismatch = -0.05)
          │
          ▼
@@ -105,7 +105,7 @@ class EntityIndex:
     def __init__(self, use_case: str, weaviate_client) -> None:
         self.use_case = use_case
         self._client = weaviate_client
-        self._collection_name = f"Entity_{use_case}_v1"  # from ontology.weaviate_collection_spec()
+        self._collection_name = f"Entity_{use_case}_v1"  # from schema.weaviate_collection_spec()
 
     def find_candidates(
         self,
@@ -120,7 +120,7 @@ class EntityIndex:
                 near_vector=embedding,
                 limit=top_k,
                 filters=Filter.by_property("type").equal(entity_type),
-                return_properties=["canonical_name", "type", "subtype", "description", "aliases"],
+                return_properties=["canonical_name", "type", "subtype", "description"],
                 return_metadata=MetadataQuery(distance=True),
             )
         )
@@ -131,7 +131,6 @@ class EntityIndex:
                 type=obj.properties["type"],
                 subtype=obj.properties.get("subtype"),
                 description=obj.properties.get("description", ""),
-                aliases=obj.properties.get("aliases", []),
                 score=1.0 - obj.metadata.distance,   # convert distance → similarity
             )
             for obj in results.objects
@@ -148,7 +147,6 @@ class Candidate:
     type:           str
     subtype:        str | None
     description:    str
-    aliases:        list[str]
     score:          float        # cosine similarity from Weaviate
 ```
 
@@ -169,8 +167,8 @@ class DisambiguationResult:
     candidates:   list[Candidate]
 
 def disambiguate(
-    local_entity:     LocalEntity,   # from Normalizer output
-    embedding:        list[float],   # from entity encoder (bge-m3 via Ollama)
+    resolved_entity:  ResolvedEntity,  # from resolver output (03)
+    embedding:        list[float],     # from entity encoder (bge-m3 via Ollama)
     entity_index:     EntityIndex,
     merge_threshold:  float,
     review_low:       float,
@@ -178,11 +176,11 @@ def disambiguate(
     llm_adjudicate:   bool = True,
 ) -> DisambiguationResult:
 
-    candidates = entity_index.find_candidates(embedding, local_entity.type, top_k)
+    candidates = entity_index.find_candidates(embedding, resolved_entity.type, top_k)
     if not candidates:
         return DisambiguationResult("create", None, 1.0, [])
 
-    best = _score(candidates, local_entity)
+    best = _score(candidates, resolved_entity)
 
     if best.score >= merge_threshold:
         return DisambiguationResult("merge", best.canonical_id, best.score, candidates)
@@ -194,7 +192,7 @@ def disambiguate(
         )
 
     # Mid-confidence: ask the LLM
-    verdict = _llm_adjudicate(local_entity, best)
+    verdict = _llm_adjudicate(resolved_entity, best)
     if verdict == "yes":
         return DisambiguationResult("merge", best.canonical_id, best.score, candidates)
     if verdict == "no":
@@ -202,13 +200,16 @@ def disambiguate(
     return DisambiguationResult("review", None, best.score, candidates)
 ```
 
-**Scoring function** (`_score`): applies alias bonus (+0.15 if local entity name is in
-`candidate.aliases`, capped at 1.0) and subtype penalty (-0.05 if subtypes differ).
-Returns the highest-scoring candidate after adjustments.
+**Scoring function** (`_score`): the score is the candidate's vector cosine similarity with a
+subtype penalty (-0.05 if subtypes differ, floored at 0.0). Returns the highest-scoring
+candidate after the adjustment. There is no alias/name bonus — name similarity is already
+captured by the embedding, and exact-match shortcuts are the orchestrator's concern, not this
+endpoint's.
 
 **LLM adjudication** (`_llm_adjudicate`): single short prompt to Ollama asking whether
-`local_entity.canonical_name` and `candidate.canonical_name` refer to the same real-world
-entity, given both descriptions. Response schema: `{"verdict": "yes"|"no"|"unsure"}`.
+`resolved_entity.canonical_name` and `candidate.canonical_name` refer to the same real-world
+entity, given the new entity's `evidence` sentences and the candidate's stored description.
+Response schema: `{"verdict": "yes"|"no"|"unsure"}`.
 Uses `EXTRACTION_MODEL` and a 30-second timeout. On Ollama error, returns `"unsure"` and
 logs WARNING (non-fatal).
 
@@ -231,14 +232,14 @@ _REVIEW_LOW       = float(_os.environ.get("DISAMBIG_REVIEW_LOW",      "0.75"))
 _DISAMBIG_TOP_K   = int(  _os.environ.get("DISAMBIG_TOP_K",           "10"))
 
 def entity_disambiguate(
-    local_entity,
+    resolved_entity,
     embedding: list[float],
     use_case: str,
 ) -> dict:
     """Returns {decision, canonical_id, confidence, candidates[]}."""
     idx = EntityIndex(use_case, _get_weaviate_client())
     result = disambiguate(
-        local_entity=local_entity,
+        resolved_entity=resolved_entity,
         embedding=embedding,
         entity_index=idx,
         merge_threshold=_MERGE_THRESHOLD,
@@ -267,12 +268,12 @@ from api.models import EntityDisambiguateRequest, EntityDisambiguateResponse
 @router.post("/entity-disambiguate", response_model=EntityDisambiguateResponse)
 def entity_disambiguate(req: EntityDisambiguateRequest) -> EntityDisambiguateResponse:
     result = dedup_service.entity_disambiguate(
-        local_entity=req.local_entity,
+        resolved_entity=req.resolved_entity,
         embedding=req.embedding,
         use_case=req.use_case,
     )
     return EntityDisambiguateResponse(
-        local_id=req.local_entity.local_id,
+        canonical_name=req.resolved_entity.canonical_name,
         **result,
     )
 ```
@@ -287,9 +288,9 @@ Append after existing models:
 # --- Entity Disambiguation ---
 
 class EntityDisambiguateRequest(BaseModel):
-    use_case:     str
-    local_entity: LocalEntity       # from normalizer output
-    embedding:    list[float]       # bge-m3 vector, 1024-dim
+    use_case:        str            # selects the graph (Weaviate) collection to query
+    resolved_entity: ResolvedEntity # from resolver output (03)
+    embedding:       list[float]    # bge-m3 vector, 1024-dim
 
 class CandidateResult(BaseModel):
     canonical_id:   str
@@ -297,15 +298,14 @@ class CandidateResult(BaseModel):
     type:           str
     subtype:        str | None
     description:    str
-    aliases:        list[str]
-    score:          float
+    score:          float       = Field(ge=0.0, le=1.0)
 
 class EntityDisambiguateResponse(BaseModel):
-    local_id:     str
-    decision:     Literal["merge", "create", "review"]
-    canonical_id: str | None
-    confidence:   float
-    candidates:   list[CandidateResult]
+    canonical_name: str             # echoes the resolved entity being placed
+    decision:       Literal["merge", "create", "review"]
+    canonical_id:   str | None      # the graph node id when decision == "merge"
+    confidence:     float
+    candidates:     list[CandidateResult]
 ```
 
 ---
@@ -320,6 +320,11 @@ or the client submitting to `/entity-disambiguate`) is responsible for computing
 The `/entity-disambiguate` endpoint accepts a pre-computed `embedding: list[float]` so:
 - The caller decides which model produced it (as long as it matches what Weaviate stores)
 - The NLP service does not load a second embedding model into process memory
+
+**Embedding composition must be identical at query and insert time**, or the vectors don't
+share a space. Fix one recipe — embed `f"{canonical_name}\n{description}"` (Spanish
+description) — and use it both when the orchestrator inserts a canonical node and when it
+queries here. `entity_encoder.embed()` is the single helper both paths call.
 
 A thin helper `nlp/entity_encoder.py` is provided for internal use and testing:
 
@@ -345,7 +350,7 @@ def embed(texts: list[str]) -> list[list[float]]:
 ## Weaviate setup
 
 The Weaviate collection for each use case is created by the persistence module (out of
-scope for this document) using `ontology.weaviate_collection_spec()`. The disambiguator
+scope for this document) using `schema.weaviate_collection_spec()`. The disambiguator
 assumes the collection already exists and reads from it only.
 
 ---
@@ -366,8 +371,8 @@ assumes the collection already exists and reads from it only.
 ## Testing
 
 See [06-testing.md](06-testing.md) §3 — `disambiguator.py` is pure logic; candidates
-are passed in so there is no Weaviate or LLM dependency in core tests. Full threshold,
-alias bonus, subtype penalty, and LLM adjudication paths are covered.
+are passed in so there is no Weaviate or LLM dependency in core tests. Threshold,
+subtype penalty, and LLM adjudication paths are covered.
 
 ---
 
@@ -375,7 +380,7 @@ alias bonus, subtype penalty, and LLM adjudication paths are covered.
 
 - `weaviate-client>=4.0` — **new package** (Weaviate Python v4 SDK, needed by orchestrator
   for candidate retrieval; not imported by `disambiguator.py` itself)
-- `nlp/ontology.py`
+- `nlp/schema.py`
 - `nlp/entity_encoder.py`
 - Ollama sidecar (LLM adjudication + entity embedding)
 - `httpx` — already in requirements.txt

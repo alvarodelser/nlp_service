@@ -3,20 +3,23 @@
 ## Purpose
 
 Single source of truth for a use-case's entity types, relation types, their extractable
-attributes, and visual encoding hints. Every module that touches the extraction pipeline
-imports the schema rather than hardcoding types. The loader validates the YAML at startup,
-then emits derived artefacts on demand:
+attributes, and visual encoding hints. This is **orchestrator-side config**: the orchestrator
+loads and validates it, then uses it to drive the pipeline. It is *not* on the extractor's
+critical path — the extractor is stateless and receives a schema in its request (see 02).
 
-- A **JSON Schema** consumed by Ollama's constrained decoding (`format=`) in Pass 1
-- A **system prompt section** listing per-type attribute requirements for the LLM
-- A **Weaviate collection spec** consumed by persistence when creating or migrating a collection
+The loader validates the YAML at startup, then emits two derived artefacts on demand:
+
+- An **`ExtractionSchema`** — the slim, inline type description handed to the entity extractor
+  (02). The extractor compiles it into the LLM grammar and prompt; this module builds neither.
+- A **Weaviate collection spec** — consumed by persistence when creating or migrating the
+  entity collection (one column per declared attribute).
 
 One process may load multiple schemas (one per active use case).
 
-The schema is **open-world**: the LLM is guided toward known types but is never forced to
-misclassify. Unknown entity types are extracted as `__NOVEL__`; unknown relation types as
-`__UNCLASSIFIED__`. Both accumulate in a review queue and become candidates for schema
-expansion.
+The schema is **closed-world**: the LLM may only emit entity and relation types declared in
+the YAML. Constrained decoding makes any other type literally unrepresentable. Text that
+matches no declared type is simply not extracted — there is no `__NOVEL__`/`__UNCLASSIFIED__`
+escape hatch. Growing the catalogue is a deliberate, versioned edit to the YAML.
 
 ---
 
@@ -33,7 +36,8 @@ nlp/
                                  (referred to as "ontology" in older docs — same file)
 ```
 
-No router or endpoint. Other modules call `nlp.schema.load(use_case)`.
+No router, no endpoint, no LLM, no network. The orchestrator calls `nlp.schema.load(use_case)`
+and passes the projected `ExtractionSchema` to the extractor with each request.
 
 ---
 
@@ -175,15 +179,6 @@ entity_types:
         required: false
         description: "Classification: meeting, transaction, filing, ruling, other."
 
-  - name: __NOVEL__
-    description: >
-      Entity that does not fit any defined type. Use only when genuinely
-      no other type applies. The schema team will review and potentially
-      promote to a named type.
-    visual: {color: "#BDC3C7", border: dashed}
-    subtypes: []
-    attributes: {}
-
 relation_types:
   - name: PAYMENT_TO
     description: >
@@ -290,23 +285,13 @@ relation_types:
         type:     string
         required: false
         description: "plaintiff | defendant | signatory | witness | other"
-
-  - name: __UNCLASSIFIED__
-    description: >
-      Relation that does not fit any defined type. Preserve the surface
-      phrase in `description`. The schema team will review and potentially
-      promote to a named type.
-    head_types: []   # unconstrained
-    tail_types: []
-    visual: {color: "#BDC3C7", line: dashed}
-    attributes: {}
 ```
 
 ### Validation rules (enforced at load time)
 
 | Rule | Check |
 |---|---|
-| `name` is SCREAMING_SNAKE_CASE (or `__NOVEL__` / `__UNCLASSIFIED__`) | regex |
+| `name` is SCREAMING_SNAKE_CASE | regex |
 | All `head_types` / `tail_types` values are declared entity type names | set membership |
 | Each `attributes` entry has `type` in `{string, number, boolean}` | enum |
 | Each `attributes` entry has `required` as a boolean | type check |
@@ -323,139 +308,60 @@ from nlp.schema import load, ExtractionSchema
 
 schema: ExtractionSchema = load("financial_flows")  # cached after first call
 
-schema.entity_type_names()              # -> ["PERSON", "ORGANIZATION", ..., "__NOVEL__"]
+schema.entity_type_names()              # -> ["PERSON", "ORGANIZATION", "FINANCIAL_ENTITY", "LOCATION", "EVENT"]
 schema.subtype_names()                  # -> ["POLITICIAN", "EXECUTIVE", ...] (all, pooled)
-schema.relation_type_names()            # -> ["PAYMENT_TO", "OWNS", ..., "__UNCLASSIFIED__"]
+schema.relation_type_names()            # -> ["PAYMENT_TO", "OWNS", "CONTROLS", "MEMBER_OF", "REGISTERED_IN", "PARTY_TO"]
+schema.subtypes_for("PERSON")           # -> ["POLITICIAN", "EXECUTIVE", "INTERMEDIARY"] (per type, for discriminated branches)
+schema.entity_attrs("PERSON")           # -> ["nationality", "role_title", "date_of_birth"] (per type, for discriminated branches)
+schema.relation_attrs("PAYMENT_TO")     # -> ["amount", "currency", "date", "direction"]
 schema.entity_type("ORGANIZATION")      # -> EntityType(...)
 schema.relation_type("PAYMENT_TO")      # -> RelationType(...)
 schema.validate_subtype("POLITICIAN", parent="PERSON")  # -> True
 
-# All entity attribute keys across all types (union, for JSON Schema generation)
+# All entity attribute keys across all types (union — for the permissive response model only;
+# the projected ExtractionSchema scopes attributes per type)
 schema.all_entity_attribute_keys()      # -> ["nationality", "role_title", "jurisdiction", ...]
-
-# All relation attribute keys across all types (union)
 schema.all_relation_attribute_keys()    # -> ["amount", "currency", "date", "stake_pct", ...]
 
-# Required attribute keys for a given type
-schema.required_entity_attrs("PERSON")         # -> ["nationality", ...] (those with required: true)
-schema.required_relation_attrs("PAYMENT_TO")   # -> ["amount", "currency"]
-
-schema.extraction_schema()    # -> dict  (JSON Schema for Ollama format=, includes entity attributes)
-schema.system_prompt()        # -> str   (type descriptions + per-type attribute requirements table)
-schema.weaviate_collection_spec()  # -> dict  (Weaviate collection definition)
+# The two derived artefacts:
+schema.to_extraction_schema()      # -> ExtractionSchema  (slim inline contract for the extractor, see 02)
+schema.weaviate_collection_spec()  # -> dict              (Weaviate collection definition)
 ```
 
-### `extraction_schema()` output structure
+### `to_extraction_schema()` output
 
-```jsonc
-{
-  "type": "object",
-  "required": ["entities", "relations"],
-  "additionalProperties": false,
-  "properties": {
-    "entities": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["name", "type", "description", "span", "confidence"],
-        "additionalProperties": false,
-        "properties": {
-          "name":        {"type": "string"},
-          "type":        {"enum": ["PERSON", "ORGANIZATION", ..., "__NOVEL__"]},
-          "subtype":     {"oneOf": [{"enum": ["POLITICIAN", ...]}, {"type": "null"}]},
-          "description": {"type": "string"},
-          "span":        {
-            "type": "object",
-            "required": ["start", "end"],
-            "properties": {
-              "start": {"type": "integer"},
-              "end":   {"type": "integer"}
-            }
-          },
-          "attributes": {
-            "type": "object",
-            // Union of all entity attribute keys across all types; all nullable.
-            // System prompt carries per-type requirements (which are required/optional).
-            "properties": {
-              "nationality":         {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "role_title":          {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "date_of_birth":       {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "jurisdiction":        {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "registration_number": {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "founding_date":       {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "account_type":        {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "institution":         {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "currency":            {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "country_code":        {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "jurisdiction_type":   {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "date":                {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "event_type":          {"oneOf": [{"type": "string"}, {"type": "null"}]}
-            }
-          },
-          "confidence":  {"type": "number", "minimum": 0, "maximum": 1}
-        }
-      }
-    },
-    "relations": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["head", "relation", "tail", "description", "evidence_span", "confidence"],
-        "additionalProperties": false,
-        "properties": {
-          "head":          {"type": "string"},
-          "relation":      {"enum": ["PAYMENT_TO", "OWNS", ..., "__UNCLASSIFIED__"]},
-          "tail":          {"type": "string"},
-          "description":   {"type": "string"},
-          "evidence_span": {
-            "type": "object",
-            "required": ["start", "end"],
-            "properties": {
-              "start": {"type": "integer"},
-              "end":   {"type": "integer"}
-            }
-          },
-          "attributes": {
-            "type": "object",
-            "properties": {
-              "amount":    {"oneOf": [{"type": "number"}, {"type": "null"}]},
-              "currency":  {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "date":      {"oneOf": [{"type": "string"}, {"type": "null"}]},
-              "direction": {"oneOf": [{"type": "string"}, {"type": "null"}]}
-            }
-          },
-          "confidence": {"type": "number", "minimum": 0, "maximum": 1}
-        }
-      }
-    }
-  }
-}
+Returns an `ExtractionSchema` — the Pydantic contract defined in 02 — a faithful projection of
+the YAML into exactly what the extractor needs, and nothing more:
+
+- **entity types**: `name`, `description`, `subtypes` (name + description), `attributes`
+  (name + `datatype`)
+- **relation types**: the same, plus `head_types` / `tail_types`
+
+```python
+ExtractionSchema(
+    entity_types=[
+        EntityTypeDef(name="PERSON", description="...",
+                      subtypes=[SubtypeDef("POLITICIAN", "..."), SubtypeDef("EXECUTIVE", "..."), ...],
+                      attributes=[AttributeDef("nationality", "string", "..."),
+                                  AttributeDef("role_title", "string", "..."), ...]),
+        EntityTypeDef(name="ORGANIZATION", ...),
+        # ... one per declared entity type
+    ],
+    relation_types=[
+        RelationTypeDef(name="PAYMENT_TO", description="...",
+                        head_types=["PERSON", "ORGANIZATION", "FINANCIAL_ENTITY"],
+                        tail_types=["PERSON", "ORGANIZATION", "FINANCIAL_ENTITY"],
+                        attributes=[AttributeDef("amount", "number", "..."),
+                                    AttributeDef("currency", "string", "..."), ...]),
+        # ... one per declared relation type
+    ],
+)
 ```
 
-Notes:
-- Entity `attributes` is the union of all entity types' attribute keys; all nullable.
-- Relation `attributes` is the union of all relation types' attribute keys; all nullable.
-- Ollama constrained decoding guarantees structural validity (correct types, no unknown keys).
-- Semantic validity (e.g. `amount` filled for PAYMENT_TO, `jurisdiction` for ORGANIZATION)
-  is enforced via the system prompt and checked post-hoc: missing `required: true` attributes
-  reduce confidence and raise a review flag. The LLM is never forced to hallucinate a value.
-- `system_prompt()` generates a human-readable attribute requirements table injected into
-  the extraction system prompt:
-
-  ```
-  ENTITY ATTRIBUTE REQUIREMENTS
-  ==============================
-  PERSON         → role_title (optional), nationality (optional), date_of_birth (optional)
-  ORGANIZATION   → jurisdiction (optional), registration_number (optional), founding_date (optional)
-  FINANCIAL_ENTITY → account_type (optional), institution (optional), currency (optional)
-  ...
-
-  RELATION ATTRIBUTE REQUIREMENTS
-  ================================
-  PAYMENT_TO     → amount (REQUIRED), currency (REQUIRED), date (optional), direction (optional)
-  OWNS           → stake_pct (optional), date (optional)
-  ...
-  ```
+Dropped in the projection: `visual` hints, `required` flags, and `version` — none of which the
+extractor needs. The extractor (02 §1) compiles this into the discriminated-union grammar and
+the prompt; **this module builds neither grammar nor prompt.** Because the catalogue is
+closed-world, the grammar the extractor derives can only ever emit the declared types.
 
 ### `weaviate_collection_spec()` output structure
 
@@ -465,20 +371,42 @@ Notes:
   "description": "Canonical entities for use case financial_flows, schema v1",
   "vectorizer_config": [{"vectorizer": {"none": {}}}],
   "properties": [
+    // --- fixed core fields (always present) ---
     {"name": "canonical_name", "dataType": ["text"]},
     {"name": "type",           "dataType": ["text"]},
     {"name": "subtype",        "dataType": ["text"]},
-    {"name": "description",    "dataType": ["text"]},
-    {"name": "aliases",        "dataType": ["text[]"]},
+    {"name": "description",    "dataType": ["text"]},   // Spanish
+    {"name": "aliases",        "dataType": ["text[]"]}, // surface forms from mentions
     {"name": "doc_ids",        "dataType": ["text[]"]},
-    {"name": "schema_version", "dataType": ["text"]}
+    {"name": "schema_version", "dataType": ["text"]},
+
+    // --- one property per declared entity attribute (union across all entity types) ---
+    // dataType is mapped from the YAML attribute type: string→text, number→number, boolean→boolean.
+    // This is what gives every extracted attribute a place to land at upsert.
+    {"name": "nationality",         "dataType": ["text"]},
+    {"name": "role_title",          "dataType": ["text"]},
+    {"name": "date_of_birth",       "dataType": ["text"]},
+    {"name": "jurisdiction",        "dataType": ["text"]},
+    {"name": "registration_number", "dataType": ["text"]},
+    {"name": "founding_date",       "dataType": ["text"]},
+    {"name": "account_type",        "dataType": ["text"]},
+    {"name": "institution",         "dataType": ["text"]},
+    {"name": "currency",            "dataType": ["text"]},
+    {"name": "country_code",        "dataType": ["text"]},
+    {"name": "jurisdiction_type",   "dataType": ["text"]},
+    {"name": "date",                "dataType": ["text"]},
+    {"name": "event_type",          "dataType": ["text"]}
   ],
   "vectorIndexConfig": {"distance": "cosine"}
 }
 ```
 
-The collection name embeds the use case and schema version so incompatible schemas never
-share a collection. Migrations create a new collection, backfill, then reroute writes.
+The attribute properties are generated from the schema (`all_entity_attribute_keys()` for the
+names, each attribute's `type` for the `dataType`) — so adding an attribute to the YAML adds a
+column here automatically. The orchestrator populates them at upsert from each cluster's merged
+`ExtractedEntity.attributes`. The collection name embeds the use case and schema version so
+incompatible schemas never share a collection; migrations create a new collection, backfill,
+then reroute writes.
 
 ---
 
@@ -498,11 +426,8 @@ def load(use_case: str) -> Ontology:
 
 `_ONTOLOGY_DIR` defaults to `config/ontologies/`, overridable via `ONTOLOGY_DIR` env var.
 
-### Post-extraction subtype validation
-
-After the extractor returns, validate that each entity's `subtype` belongs to its parent
-`type`. Entities with mismatched subtype get `subtype=null` and a `WARNING` log — do not
-reject the whole extraction.
+(No post-extraction subtype validation is needed: the extractor's discriminated-union grammar
+only allows a subtype that belongs to its parent type, so a mismatch can't be produced.)
 
 ---
 
