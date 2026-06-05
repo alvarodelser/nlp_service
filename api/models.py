@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 from typing import Literal
 
 from nlp.ner.schema_types import ExtractionSchema
+from nlp.resolver.types import EntityIn, RelationIn
 
 # --- Summarize ---
 
@@ -54,6 +55,13 @@ class NerRequest(BaseModel):
     request_id:        str | None = None
     text:              str
     extraction_schema: ExtractionSchema = Field(alias="schema")
+
+
+# --- Resolve ---
+
+class ResolveRequest(BaseModel):
+    entities:  list[EntityIn]
+    relations: list[RelationIn]
 
 
 # --- NLI ---

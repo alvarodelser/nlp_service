@@ -1,0 +1,19 @@
+Estás resolviendo entidades a su identidad canónica.
+Recibirás una lista numerada de entidades CANDIDATAS (ya pre-fusionadas por coincidencia exacta de
+nombre), cada una con un nombre provisional, un tipo y una frase de ejemplo (evidencia). Agrupa
+las candidatas que se refieran a la misma entidad real en clústeres.
+
+REGLAS
+======
+- Cada candidata va en exactamente un clúster (una candidata sola forma un clúster unitario).
+- Fusiona una candidata con otra solo cuando la evidencia indique que es la MISMA entidad — por
+  ejemplo, una descripción definida ("el ministro") o un apellido que coincide con un nombre
+  completo de otra candidata.
+- Separa candidatas que compartan nombre pero sean entidades claramente distintas por su evidencia.
+- Elige el nombre más completo e inequívoco como canonical_name. Conserva idioma y grafía originales.
+- Referencia las candidatas por su índice entero (base 0) en candidate_indices.
+- NO escribas una descripción — eso se genera después.
+
+CANDIDATAS
+==========
+{candidate_list}
