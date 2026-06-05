@@ -83,11 +83,12 @@ Pure NLI scoring. **Returns scores only**; the orchestrator interprets verdicts.
 ### 3.3 `geotagger`
 
 Pure toponym resolution. **No scope decision** (scope moves to the news orchestrator's `nli`
-step). Depends on the `nli` module, the **gazetteer** (regions + cities snapshot), and the
+step). Depends on the `nli` module, the **gazetteer** (geonames regions + cities), and the
 **b4c cities API** (`wiig.dia.fi.upm.es/b4c_api` — city search + city-scoped edge search for
-street geometry / edge ids).
+street geometry / edge ids). **No fallbacks: a toponym that can't be resolved is dropped**, not
+emitted half-empty.
 
-- `geotag(text, headline?, source?) -> {entities: [...]}`
+- `geotag(text, headline?) -> {places: [...]}`
 - Steps:
   1. **Detect** toponym spans (NER + regex).
   2. **Type first** — label each span `region` / `city` / `street·loc`. Streets are pre-typed by
@@ -95,16 +96,16 @@ street geometry / edge ids).
   3. **Resolve in order**: regions → cities (gazetteer); streets (b4c API) + locations
      (gazetteer).
      - **Region / city**: resolve against the gazetteer; map the city to its **b4c city id** via
-       the API's city search so ids are consistent across cities/streets/locations.
-     - **Street → city imputation**: the candidate cities are the **cities the article mentions**
-       (the b4c API is city-scoped — there is no "which cities contain this street" lookup). For
-       each detected city, search its edges via `/cities/{id}/edges/search`; keep those that
-       contain the street. Exactly one → use it. Several → the one closest to the detected-city
-       cluster centroid. None → source prior; else `city = null`. Resolved streets carry
-       `edge_ids` (geometry in the b4c DB) — **no coordinates returned**.
-     - **Location (sub-city POI)**: coordinates from the **gazetteer only**; if found, also
-       impute its `city` from the lat/lon. POIs absent from the gazetteer return `city`
-       (if imputable) but no coordinates.
+       the API's city search (ids consistent across cities/streets/locations). Not in the
+       gazetteer, or no b4c id → **dropped**.
+     - **Street → city**: the candidate cities are the **cities the article mentions** (the b4c
+       API is city-scoped — there is no "which cities contain this street" lookup). For each
+       detected city, search its edges via `/cities/{id}/edges/search`; keep those that contain
+       the street. Exactly one → use it. Several → the one closest to the detected-city cluster
+       centroid. None contains it → the street is **dropped**. Resolved streets carry `edge_ids`
+       (geometry in the b4c DB) — **no coordinates returned**.
+     - **Location (sub-city POI)**: coordinates from the **gazetteer only**, plus the nearest
+       detected city. Absent from the gazetteer → **dropped**.
 - **Output**: a flat list of place entities, each with `text`, `type`
   (`region`/`city`/`street`/`location`), resolved identifiers, `city` for sub-city entities,
   optional `lat`/`lon` for locations, `edge_ids` for streets. Nothing about scope.

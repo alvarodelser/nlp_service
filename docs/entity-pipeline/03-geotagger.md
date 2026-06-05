@@ -47,12 +47,12 @@ Three structural changes drive this rework:
 | Component | Status |
 |---|---|
 | `nlp/geotagger/ner.py` | **Unchanged** (Flair NER + street regex) |
-| `nlp/geotagger/gazetteer.py` — `load`, `lookup`, `_normalize`, source prior | **Kept** |
-| `nlp/geotagger/gazetteer.py` — `load_streets`, `lookup_street`, `lookup_street_all_cities`, `_street_index`, `STREET_INDEX_PATH` | **Deleted** (→ b4c API) |
+| `nlp/geotagger/gazetteer.py` — `load`, `lookup`, `_normalize` | **Kept** |
+| `nlp/geotagger/gazetteer.py` — street index + source prior (`load_streets`, `lookup_street*`, `load_source_prior`, `get_city_prior`, `STREET_INDEX_PATH`, `SOURCE_PRIOR_PATH`) | **Deleted** (b4c API; no fallbacks) |
 | `nlp/geotagger/cities_api.py` | **New** — httpx client for the b4c cities API |
-| `nlp/geotagger/service.py` | **Rewritten** — detect → type → resolve → impute; no scope |
-| `nlp/geotagger/data/geonames_es.tsv`, `data/cities_snapshot.json` | **Kept** (snapshot now only for source-prior name + centroids) |
-| `config/street_index.json` | **Deleted** (data now behind the API) |
+| `nlp/geotagger/service.py` | **Rewritten** — detect → type → resolve; **unresolved dropped, no source prior, no cities snapshot** |
+| `nlp/geotagger/data/geonames_es.tsv` | **Kept** — built at image build (`scripts/build_geonames_es.py`, HTTPS download) |
+| `config/street_index.json`, `config/source_city_prior.json`, `cities_snapshot.json` | **Deleted** (b4c API; unresolved toponyms are dropped) |
 | `api/routers/geotag.py` | **Simplified** — new response, no scope |
 | `api/models.py` — `GeotagResponse`, `GeoCity`, `GeoStreet`, `GeoPoint`, `PlaceMention` | **Replaced** by `GeoEntity` + new `GeotagResponse` |
 | `api/main.py` warmup | `gazetteer.load_streets()` removed; geonames + snapshot warmup kept |
@@ -92,12 +92,11 @@ adjust the field name in `_edge_ids()` if the real payload differs.
 nlp/geotagger/
   __init__.py
   ner.py            ← unchanged
-  gazetteer.py      ← regions + cities (geonames) + source prior; street funcs removed
+  gazetteer.py      ← geonames regions + cities lookup (street + source-prior funcs removed)
   cities_api.py     ← NEW: httpx client for the b4c cities API
   service.py        ← rewritten
   data/
-    geonames_es.tsv
-    cities_snapshot.json
+    geonames_es.tsv  ← built at image build (scripts/build_geonames_es.py)
 api/routers/geotag.py
 ```
 
@@ -125,20 +124,22 @@ class GeoEntity(BaseModel):
 
 class GeotagResponse(BaseModel):
     request_id: str | None = None
-    places:     list[GeoEntity]
+    places:     list[GeoEntity]            # only resolved places; unresolved toponyms are dropped
+    trace:      dict | None = None         # per-stage internals when debug=True
 ```
 
-`GeotagRequest` keeps `text`, `headline`, `source`; rename `article_id` → optional `request_id`:
+`GeotagRequest` keeps `text`, `headline`; rename `article_id` → optional `request_id`:
 
 ```python
 class GeotagRequest(BaseModel):
     request_id: str | None = None
     text:       str
     headline:   str = ""
-    source:     str = ""
+    debug:      bool = False               # include per-stage `trace` in the response
 ```
 
-No `geo_scope`/`geo_region`/`geo_cities`/`geo_points`/`all_places`/`city`/`city_confidence`.
+No `geo_scope`/`geo_region`/`geo_cities`/`geo_points`/`all_places`/`city`/`city_confidence`, and
+**no `source`** (the source-prior fallback is gone).
 
 > The existing `eval/` notebooks (test-only) are **deprecated**; a new test suite will be
 > designed in a later pass and is out of scope for these implementation docs.
@@ -222,19 +223,12 @@ and locations impute their city from those. One internal pass, no second round-t
 
 ```python
 from __future__ import annotations
-import json, logging, math, os, re, unicodedata
-from pathlib import Path
+import logging, math, re, unicodedata
 
 from . import cities_api, gazetteer, ner
 from nlp import nli
 
 log = logging.getLogger("nlp_service.geotagger")
-
-_CITIES_PATH = Path(os.environ.get(
-    "CITIES_SNAPSHOT_PATH",
-    Path(__file__).parent / "data" / "cities_snapshot.json"))
-_cities: list[dict] = []
-_by_id: dict[int, dict] = {}          # snapshot id → city dict (source-prior name lookup)
 
 _CITY_TEMPLATE = "Este artículo describe principalmente hechos o iniciativas en {}."
 _MAX_CITY_CANDIDATES = 10
@@ -251,19 +245,8 @@ def _normalize(s: str) -> str:
                    if unicodedata.category(c) != "Mn")
 
 
-def _load_cities() -> None:
-    global _cities, _by_id
-    if _cities or not _CITIES_PATH.exists():
-        return
-    _cities = json.loads(_CITIES_PATH.read_text(encoding="utf-8"))
-    for c in _cities:
-        _by_id[c["id"]] = c
-
-
 def load() -> None:
     gazetteer.load()
-    gazetteer.load_source_prior()
-    _load_cities()
 
 
 def _haversine(lat1, lon1, lat2, lon2) -> float:
@@ -305,7 +288,7 @@ def _nearest_city_to_point(lat: float, lon: float, detected) -> "GeoEntity | Non
     return best
 
 
-def run(text: str, headline: str = "", source: str = "") -> dict:
+def run(text: str, headline: str = "", debug: bool = False) -> dict:
     load()
     premise = f"{headline}. {text}" if headline else text
     spans = ner.extract_spans(premise)
@@ -316,33 +299,47 @@ def run(text: str, headline: str = "", source: str = "") -> dict:
 
     for s, t in typed:                                   # regions
         if t == "region":
-            places.append(_resolve_region(s))
+            place = _resolve_region(s)
+            if place:
+                places.append(place)
 
     for s, t in typed:                                   # cities (+ collect detected)
         if t == "city":
             place = _resolve_city(s, premise)
-            places.append(place)
-            if place.city_id is not None and place.lat is not None:
-                detected_cities.append(place)
+            if place:
+                places.append(place)
+                if place.lat is not None:
+                    detected_cities.append(place)
 
-    for s, t in typed:                                   # streets (search within detected cities)
+    for s, t in typed:                                   # streets (within detected cities)
         if t == "street":
-            places.append(_resolve_street(s, source, detected_cities))
+            place = _resolve_street(s, detected_cities)
+            if place:
+                places.append(place)
 
     for s, t in typed:                                   # locations (gazetteer coords)
         if t == "location":
-            places.append(_resolve_location(s, detected_cities))
+            place = _resolve_location(s, detected_cities)
+            if place:
+                places.append(place)
 
-    return {"places": [p for p in places if p is not None]}
+    result = {"places": places}
+    if debug:                                            # per-stage trace for the notebooks
+        result["trace"] = {
+            "spans": [{"text": s.text, "label": s.label, "hint": s.hint} for s in spans],
+            "typed": [{"text": s.text, "type": t} for s, t in typed],
+            "detected_cities": [{"city_id": d.city_id, "city_name": d.city_name} for d in detected_cities],
+        }
+    return result
 ```
 
 ### Region resolution
 
 ```python
-def _resolve_region(span: ner.Span) -> GeoEntity:
+def _resolve_region(span: ner.Span) -> GeoEntity | None:
     entries = [e for e in gazetteer.lookup(span.text) if e.feature_class == "A"]
     if not entries:
-        return GeoEntity(text=span.text, type="region")
+        return None                                   # not in gazetteer → drop
     best = max(entries, key=lambda e: e.population)
     return GeoEntity(text=span.text, type="region", name=best.name,
                      geonames_id=best.geonames_id, admin1_code=best.admin1_code,
@@ -352,10 +349,10 @@ def _resolve_region(span: ner.Span) -> GeoEntity:
 ### City resolution (gazetteer detection + b4c id; nli homonym tie-break)
 
 ```python
-def _resolve_city(span: ner.Span, premise: str) -> GeoEntity:
+def _resolve_city(span: ner.Span, premise: str) -> GeoEntity | None:
     entries = [e for e in gazetteer.lookup(span.text) if e.feature_class == "P"]
     if not entries:
-        return GeoEntity(text=span.text, type="city")
+        return None                                   # not in gazetteer → drop
     if len(entries) == 1:
         best, conf = entries[0], 1.0
     else:
@@ -365,38 +362,28 @@ def _resolve_city(span: ner.Span, premise: str) -> GeoEntity:
         best = next(e for e in cands if e.name == result["labels"][0])
         conf = float(result["scores"][0])
     b4c = _b4c_city(best.name)
+    if not b4c:
+        return None                                   # no b4c city id → drop
     return GeoEntity(text=span.text, type="city", name=best.name,
-                     geonames_id=best.geonames_id,
-                     city_id=(b4c["id"] if b4c else None),
-                     city_name=(b4c["name"] if b4c else best.name),
+                     geonames_id=best.geonames_id, city_id=b4c["id"], city_name=b4c["name"],
                      lat=best.lat, lon=best.lon, confidence=conf)
 ```
 
 ### Street resolution (b4c API, within detected cities)
 
 ```python
-def _resolve_street(span: ner.Span, source: str, detected: list[GeoEntity]) -> GeoEntity:
+def _resolve_street(span: ner.Span, detected: list[GeoEntity]) -> GeoEntity | None:
     q = _street_query(span.text)
 
-    # Candidate cities = the cities the article mentions (they carry b4c ids + centroids).
-    candidates = [d for d in detected if d.city_id is not None]
-    if not candidates and source:                         # no text context → source prior
-        prior_id = gazetteer.get_city_prior(source)
-        snap = _by_id.get(prior_id) if prior_id is not None else None
-        b4c = _b4c_city(snap["name"]) if snap else None
-        if b4c:
-            candidates = [GeoEntity(text=snap["name"], type="city", city_id=b4c["id"],
-                                    city_name=b4c["name"], lat=snap["lat"], lon=snap["lon"])]
-
-    # Search the street within each candidate city; keep those that contain it.
+    # Candidate cities = the cities the article mentions. No source-prior fallback.
     matches: list[tuple[GeoEntity, list[int]]] = []
-    for c in candidates:
+    for c in detected:
         edge_ids = _edge_ids(cities_api.search_edges(c.city_id, q))
         if edge_ids:
             matches.append((c, edge_ids))
 
     if not matches:
-        return GeoEntity(text=span.text, type="street")   # unresolved; geometry unknown
+        return None                                       # no mentioned city contains it → drop
     if len(matches) == 1:
         c, edge_ids = matches[0]
     else:
@@ -411,21 +398,19 @@ def _resolve_street(span: ner.Span, source: str, detected: list[GeoEntity]) -> G
                      city_name=c.city_name, edge_ids=edge_ids)
 ```
 
-> **Imputation (design round 3, adapted to the API):** the candidate cities are exactly the
-> cities the article mentions — so a street is only ever attached to a city the text actually
-> talks about ("the city is implicit in the text"). The b4c edge search confirms the geometry
-> exists there. When several mentioned cities contain the same street name, the tie-break is the
-> one closest to the detected-city cluster centroid. No mentioned city contains it → source
-> prior; still nothing → `city_id = null`. Streets never carry coordinates (geometry is in the
-> b4c DB, referenced by `edge_ids`).
+> **Imputation:** candidate cities are exactly the cities the article mentions — a street is only
+> attached to a city the text actually talks about ("the city is implicit in the text"), confirmed
+> by the b4c edge search. Several matches → closest to the detected-city cluster centroid. No
+> mentioned city contains it → **the street is dropped** (no source-prior fallback). Streets never
+> carry coordinates (geometry is in the b4c DB, referenced by `edge_ids`).
 
 ### Location resolution (gazetteer coords + nearest detected city)
 
 ```python
-def _resolve_location(span: ner.Span, detected: list[GeoEntity]) -> GeoEntity:
+def _resolve_location(span: ner.Span, detected: list[GeoEntity]) -> GeoEntity | None:
     points = [e for e in gazetteer.lookup(span.text) if e.feature_class == "P"]
     if not points:
-        return GeoEntity(text=span.text, type="location")    # no gazetteer coords
+        return None                                          # no gazetteer coords → drop
     best = max(points, key=lambda e: e.population)
     near = _nearest_city_to_point(best.lat, best.lon, detected)   # nearest detected city to POI
     return GeoEntity(text=span.text, type="location", name=best.name,
@@ -434,8 +419,7 @@ def _resolve_location(span: ner.Span, detected: list[GeoEntity]) -> GeoEntity:
                      city_name=(near.city_name if near else None))
 ```
 
-Coordinates come from the **gazetteer only** (design round 2). A location with no gazetteer match
-is still returned (typed `location`, no coords) so the caller knows it was detected.
+Coordinates come from the **gazetteer only**. A location absent from the gazetteer is **dropped**.
 
 ---
 
@@ -459,7 +443,7 @@ def geotag(req: GeotagRequest) -> GeotagResponse:
     if not req.text.strip():
         raise HTTPException(status_code=422, detail="text must be non-empty")
     try:
-        result = geotagger_service.run(req.text, headline=req.headline, source=req.source)
+        result = geotagger_service.run(req.text, headline=req.headline, debug=req.debug)
     except FileNotFoundError as exc:
         log.error("geotagger data missing: %s", exc, extra={"request_id": req.request_id})
         raise HTTPException(status_code=503, detail="geotagger_data_missing")
@@ -480,12 +464,11 @@ def geotag(req: GeotagRequest) -> GeotagResponse:
 |---|---|---|
 | `B4C_API_BASE` | `https://wiig.dia.fi.upm.es/b4c_api` | Cities/edges API base URL |
 | `B4C_API_TIMEOUT` | `10` | Seconds per API call |
-| `CITIES_SNAPSHOT_PATH` | `nlp/geotagger/data/cities_snapshot.json` | City id/name/centroid snapshot (source-prior name lookup) |
-| `SOURCE_PRIOR_PATH` | `config/source_city_prior.json` | Source → snapshot city_id fallback |
 | `NER_DEVICE` | `cpu` | Flair device |
 | `NLI_MODEL` | (see doc 02) | Shared XNLI model for typing + tie-break |
 
-Removed: `STREET_INDEX_PATH` (streets now behind the b4c API).
+Removed: `STREET_INDEX_PATH`, `CITIES_SNAPSHOT_PATH`, `SOURCE_PRIOR_PATH` — the local street index,
+the cities snapshot, and the source-prior fallback are all gone (b4c API; unresolved → dropped).
 
 ---
 
@@ -493,7 +476,7 @@ Removed: `STREET_INDEX_PATH` (streets now behind the b4c API).
 
 The removed scope logic relocates to the news orchestrator (doc 07): the
 city/regional/national pass and the region/city second pass are `nli.classify(...,
-multi_label=False)` calls there, fed the `places[]` this module returns plus the source profile.
+multi_label=False)` calls there, fed the `places[]` this module returns.
 The old `_H_LOCAL/_H_REGIONAL/_H_NATIONAL` hypotheses and `_SCOPE_THRESHOLD` become orchestrator
 config.
 

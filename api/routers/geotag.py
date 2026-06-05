@@ -18,8 +18,7 @@ def geotag(req: GeotagRequest) -> GeotagResponse:
     if not req.text.strip():
         raise HTTPException(status_code=422, detail="text must be non-empty")
     try:
-        result = geotagger_service.run(req.text, headline=req.headline, source=req.source,
-                                       debug=req.debug)
+        result = geotagger_service.run(req.text, headline=req.headline, debug=req.debug)
     except FileNotFoundError as exc:
         log.error("geotagger data missing: %s", exc, extra={"request_id": req.request_id})
         raise HTTPException(status_code=503, detail="geotagger_data_missing")
