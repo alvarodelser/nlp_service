@@ -2,6 +2,8 @@
 from pydantic import BaseModel, Field
 from typing import Literal
 
+from nlp.ner.schema_types import ExtractionSchema
+
 # --- Summarize ---
 
 class SummarizeRequest(BaseModel):
@@ -41,6 +43,17 @@ class GeoEntity(BaseModel):
 class GeotagResponse(BaseModel):
     request_id: str | None = None
     places:     list[GeoEntity]
+
+
+# --- NER ---
+
+class NerRequest(BaseModel):
+    # `extraction_schema` is exposed over HTTP as "schema" (avoids shadowing BaseModel.schema).
+    model_config = {"populate_by_name": True}
+
+    request_id:        str | None = None
+    text:              str
+    extraction_schema: ExtractionSchema = Field(alias="schema")
 
 
 # --- NLI ---
