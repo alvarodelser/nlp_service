@@ -83,23 +83,25 @@ Pure NLI scoring. **Returns scores only**; the orchestrator interprets verdicts.
 ### 3.3 `geotagger`
 
 Pure toponym resolution. **No scope decision** (scope moves to the news orchestrator's `nli`
-step). Depends on the `nli` module, the **gazetteer** (regions + cities snapshot), and
-**Postgres** (street geometry / edge ids).
+step). Depends on the `nli` module, the **gazetteer** (regions + cities snapshot), and the
+**b4c cities API** (`wiig.dia.fi.upm.es/b4c_api` — city search + city-scoped edge search for
+street geometry / edge ids).
 
 - `geotag(text, headline?, source?) -> {entities: [...]}`
 - Steps:
   1. **Detect** toponym spans (NER + regex).
   2. **Type first** — label each span `region` / `city` / `street·loc`. Streets are pre-typed by
      regex (high precision); ambiguous spans are typed by a quick internal `nli` call.
-  3. **Resolve in order**: regions → cities (gazetteer); streets + locations (Postgres /
-     gazetteer).
-     - **Region / city**: resolve against the gazetteer.
-     - **Street → city imputation**: query **Postgres** for candidate cities = cities whose
-       street DB contains that street name (geometry exists). Among candidates, assign the street
-       to the **geographically closest city detected in the article text** (compare city
-       centroids). Exactly one candidate → use it. No detected cities → source prior, else
-       `city = null`. No street-DB match → `city = null`. Resolved streets carry `edge_ids`
-       (geometry already in Postgres) — **no coordinates returned**.
+  3. **Resolve in order**: regions → cities (gazetteer); streets (b4c API) + locations
+     (gazetteer).
+     - **Region / city**: resolve against the gazetteer; map the city to its **b4c city id** via
+       the API's city search so ids are consistent across cities/streets/locations.
+     - **Street → city imputation**: the candidate cities are the **cities the article mentions**
+       (the b4c API is city-scoped — there is no "which cities contain this street" lookup). For
+       each detected city, search its edges via `/cities/{id}/edges/search`; keep those that
+       contain the street. Exactly one → use it. Several → the one closest to the detected-city
+       cluster centroid. None → source prior; else `city = null`. Resolved streets carry
+       `edge_ids` (geometry in the b4c DB) — **no coordinates returned**.
      - **Location (sub-city POI)**: coordinates from the **gazetteer only**; if found, also
        impute its `city` from the lat/lon. POIs absent from the gazetteer return `city`
        (if imputable) but no coordinates.
@@ -117,10 +119,12 @@ and with `geotagger/ner.py` — flagged, not blocking.)
 - `ExtractionSchema` (inline, per call): entity types/subtypes/attributes (each with name +
   LLM-facing description; attributes also carry a datatype); relations with name + description +
   subject/object type restrictions.
-- Steps: (1) pronoun preprocessing (resolve antecedents to names, on the chunk as received),
-  (2) one constrained LLM call emitting a discriminated-union grammar (one branch per type;
-  undeclared types/attributes/datatypes unrepresentable), (3) post-validation of datatypes,
-  subtypes, attributes, and relation subject/object constraints.
+- Steps: (1) pronoun preprocessing — a **document-level** coref helper the module provides
+  (`resolve_pronouns`), which the orchestrator runs **before chunking** since antecedents cross
+  chunks; per-chunk `extract` itself stays pure. (2) one constrained LLM call emitting a
+  discriminated-union grammar (one branch per type; undeclared types/attributes/datatypes
+  unrepresentable). (3) post-validation of datatypes, subtypes, attributes, and relation
+  subject/object constraints.
 - **Output**: entities with verbatim `evidence` (the sentence they appear in); relations with
   `type`, `attributes`, `confidence`, and verbatim `evidence`. No offsets, no IDs, no
   doc-awareness — the orchestrator owns those.
@@ -225,7 +229,8 @@ chunks (text) + ExtractionSchema
 - **Storage.** Articles, entities, and relations live in **Weaviate** (per-use-case
   collections, created/owned by the orchestrators). MinHash signatures are stored as a Weaviate
   property; the FAISS + local-persistence article path is retired. **Neo4j** is written only at
-  the end of pipeline 2. **Postgres** holds street geometry / edge ids for the geotagger.
+  the end of pipeline 2. Street geometry / edge ids come from the **b4c cities API**
+  (`wiig.dia.fi.upm.es/b4c_api`), not a local store.
 - **`merge`** is an orchestrator operation, not a module. Article merge: append source+url, keep
   oldest date. Entity/relation merge: collapse a `dedup/corpus` cluster, then re-describe with
   `summarizer[aggregate]`.

@@ -1,4 +1,5 @@
-# nlp_service/nlp/extractor/extractive.py
+# nlp_service/nlp/summarizer/extractive.py
+# Moved from nlp/extractor/extractive.py (the retired TextRank extract service).
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.text_rank import TextRankSummarizer

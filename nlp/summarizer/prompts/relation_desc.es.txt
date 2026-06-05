@@ -1,0 +1,24 @@
+Escribe una descripción concisa y factual de la relación, basada únicamente en la evidencia proporcionada.
+
+RELACIÓN
+========
+Sujeto: {head}
+Objeto: {tail}
+Tipo: {type}
+{subtype_line}
+
+ATRIBUTOS
+=========
+{attributes}
+
+EVIDENCIA
+=========
+{evidence_text}
+
+REGLAS
+======
+- Máximo 2-4 frases.
+- Afirma solo lo que la evidencia respalde explícitamente. No especules.
+- Indica cantidades, fechas y datos solo si constan en la evidencia o los atributos.
+- Escribe la descripción en español, sea cual sea el idioma de la evidencia.
+- Devuelve únicamente JSON con el campo "description".

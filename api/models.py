@@ -2,140 +2,123 @@
 from pydantic import BaseModel, Field
 from typing import Literal
 
-# --- Extract ---
-
-class ExtractRequest(BaseModel):
-    article_id: str
-    text: str
-
-
-class ExtractResponse(BaseModel):
-    article_id: str
-    extract: str
-    embedding_raw: list[float]
-
+from nlp.ner.schema_types import ExtractionSchema
+from nlp.resolver.types import EntityIn, RelationIn
 
 # --- Summarize ---
 
 class SummarizeRequest(BaseModel):
-    article_id: str
-    text: str
-    extract: str       # pre-computed by /extract
-    headline: str      # original headline to rewrite
+    request_id: str | None = None
+    profile:    str                 # "article" | "entity_desc" | "relation_desc" | "aggregate"
+    fields:     dict                # profile-specific; validated by the profile/prompt
 
 
 class SummarizeResponse(BaseModel):
-    article_id: str
-    headline: str
-    summary: str
-    embedding_summary: list[float]
+    request_id: str | None = None
+    result:     dict                # e.g. {"headline","summary"} or {"description"}
 
 
 # --- Geotag ---
 
 class GeotagRequest(BaseModel):
-    article_id: str
-    text: str
-    headline: str = ""
-    source: str = ""
+    request_id: str | None = None
+    text:       str
+    headline:   str = ""
+    source:     str = ""
 
 
-class PlaceMention(BaseModel):
-    text: str
-    type: Literal["city", "street", "region", "other"]
-    lat: float | None = None
-    lon: float | None = None
+class GeoEntity(BaseModel):
+    text:        str
+    type:        Literal["region", "city", "street", "location"]
+    name:        str | None = None
     geonames_id: int | None = None
-    city_id: int | None = None
-
-
-class GeoCity(BaseModel):
-    city_id: int
-    city_name: str
-    confidence: float
-
-
-class GeoStreet(BaseModel):
-    span: str
-    edge_ids: list[int]
-    city_id: int | None = None
-
-
-class GeoPoint(BaseModel):
-    span: str
-    lat: float
-    lon: float
-    geonames_id: int | None = None
+    admin1_code: str | None = None
+    city_id:     int | None = None
+    city_name:   str | None = None
+    edge_ids:    list[int] = []
+    lat:         float | None = None
+    lon:         float | None = None
+    confidence:  float = Field(default=1.0, ge=0.0, le=1.0)
 
 
 class GeotagResponse(BaseModel):
-    article_id: str
-    geo_scope: Literal["national", "regional", "city"] | None = None
-    geo_region: str | None = None
-    geo_cities: list[GeoCity] = []
-    geo_streets: list[GeoStreet] = []
-    geo_points: list[GeoPoint] = []
-    all_places: list[PlaceMention] = []
-    # legacy — kept for backward compat with existing eval notebook
-    city: str | None = None
-    city_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    request_id: str | None = None
+    places:     list[GeoEntity]
 
 
-# --- Classify ---
+# --- NER ---
 
-class SourceProfile(BaseModel):
-    city: str | None = None
-    region: str | None = None
-    topics: list[str] = []
+class NerRequest(BaseModel):
+    # `extraction_schema` is exposed over HTTP as "schema" (avoids shadowing BaseModel.schema).
+    model_config = {"populate_by_name": True}
 
-
-class ClassifyRequest(BaseModel):
-    article_id: str
-    summary: str
-    geo_cities: list[GeoCity] = []
-    search_tags: list[str] = []
-    source_profile: SourceProfile | None = None
-    geo_scope: str | None = None
+    request_id:        str | None = None
+    text:              str
+    extraction_schema: ExtractionSchema = Field(alias="schema")
 
 
-class ClassifyResponse(BaseModel):
-    article_id: str
-    topics: list[str]
-    scores: dict[str, float]
-    geo_scope: str  # national | regional | city
-    out_of_scope: bool = False
+# --- Resolve ---
+
+class ResolveRequest(BaseModel):
+    entities:  list[EntityIn]
+    relations: list[RelationIn]
+
+
+# --- NLI ---
+
+class NliRequest(BaseModel):
+    request_id:          str | None = None
+    text:                str
+    hypotheses:          list[str]
+    threshold:           float | None = None
+    blacklist:           bool = False
+    hypothesis_template: str = "{}"
+
+
+class ScorePair(BaseModel):
+    hypothesis: str
+    score:      float = Field(ge=0.0, le=1.0)
+
+
+class NliResponse(BaseModel):
+    request_id: str | None = None
+    scores:     list[ScorePair]      # input order; len < len(hypotheses) ⇒ short-circuited
 
 
 # --- Dedup ---
 
-class DedupRequest(BaseModel):
-    article_id: str
-    text: str
+class DedupItemRequest(BaseModel):
+    request_id:       str | None = None
+    collection:       str
+    embedding:        list[float]
+    kind:             str = "article"      # article | entity | relation (LLM prompt flavour)
+    compare_text:     str = ""             # new item's comparable text (for the LLM step)
+    compare_property: str = "summary"      # stored property read for candidates
+    type_filter:      str | None = None    # restrict candidates by `type`
 
 
-class DedupCheckEmbedRequest(BaseModel):
-    article_id: str
-    embedding_raw: list[float]
+class Candidate(BaseModel):
+    id:    str
+    score: float
+    props: dict
 
 
-class DedupResponse(BaseModel):
-    article_id: str
-    duplicate_of: str | None
-    stage: Literal["minhash", "embedding"] | None = None
-    score: float | None = None
-    indexed: bool
+class DedupItemResponse(BaseModel):
+    request_id: str | None = None
+    decision:   Literal["match", "no_match"]
+    target_id:  str | None
+    score:      float
+    candidates: list[Candidate]
 
 
-class BootstrapArticle(BaseModel):
-    article_id: str
-    text: str
+class DedupCorpusRequest(BaseModel):
+    request_id:       str | None = None
+    collection:       str
+    kind:             str = "entity"
+    compare_property: str = "description"
+    type_filter:      str | None = None
 
 
-class BootstrapRequest(BaseModel):
-    articles: list[BootstrapArticle]
-
-
-class BootstrapResponse(BaseModel):
-    processed: int
-    duplicates_found: int
-    indexed: int
+class DedupCorpusResponse(BaseModel):
+    request_id: str | None = None
+    clusters:   list[list[str]]            # each inner list = one cluster of object ids

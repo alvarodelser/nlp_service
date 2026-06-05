@@ -1,0 +1,22 @@
+Fusiona las descripciones previas del mismo elemento (procedentes de varias fuentes) en una única descripción coherente y actualizada, basada únicamente en la evidencia.
+
+ELEMENTO
+========
+Nombre: {name}
+Tipo: {type}
+
+DESCRIPCIONES PREVIAS
+=====================
+{descriptions_text}
+
+EVIDENCIA
+=========
+{evidence_text}
+
+REGLAS
+======
+- Máximo 3-5 frases.
+- Integra la información de todas las descripciones; elimina repeticiones y contradicciones.
+- Afirma solo lo que la evidencia respalde explícitamente. No especules.
+- Escribe la descripción en español, sea cual sea el idioma de la evidencia.
+- Devuelve únicamente JSON con el campo "description".

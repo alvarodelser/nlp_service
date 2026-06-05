@@ -1,0 +1,4 @@
+Reescribe el texto resolviendo los pronombres de tercera persona: sustituye cada pronombre por el
+nombre más completo de su antecedente. No cambies nada más: conserva el idioma, el orden y todo el
+contenido; no parafrasees, no añadas ni elimines información. Si un pronombre no tiene antecedente
+claro, déjalo igual. Devuelve únicamente el texto reescrito, sin comentarios.
