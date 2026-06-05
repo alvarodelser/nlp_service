@@ -65,29 +65,25 @@ class GeotagResponse(BaseModel):
     city_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
-# --- Classify ---
+# --- NLI ---
 
-class SourceProfile(BaseModel):
-    city: str | None = None
-    region: str | None = None
-    topics: list[str] = []
-
-
-class ClassifyRequest(BaseModel):
-    article_id: str
-    summary: str
-    geo_cities: list[GeoCity] = []
-    search_tags: list[str] = []
-    source_profile: SourceProfile | None = None
-    geo_scope: str | None = None
+class NliRequest(BaseModel):
+    request_id:          str | None = None
+    text:                str
+    hypotheses:          list[str]
+    threshold:           float | None = None
+    blacklist:           bool = False
+    hypothesis_template: str = "{}"
 
 
-class ClassifyResponse(BaseModel):
-    article_id: str
-    topics: list[str]
-    scores: dict[str, float]
-    geo_scope: str  # national | regional | city
-    out_of_scope: bool = False
+class ScorePair(BaseModel):
+    hypothesis: str
+    score:      float = Field(ge=0.0, le=1.0)
+
+
+class NliResponse(BaseModel):
+    request_id: str | None = None
+    scores:     list[ScorePair]      # input order; len < len(hypotheses) ⇒ short-circuited
 
 
 # --- Dedup ---

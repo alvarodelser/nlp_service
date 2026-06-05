@@ -28,21 +28,19 @@ async def lifespan(app: FastAPI):
     from nlp.encoder import load_encoder as _load_encoder
     from nlp.geotagger import ner as _ner
     from nlp.geotagger import service as _geo_svc
-    from nlp.classifier import service as _cls_svc
     from nlp.dedup import service as _dedup_svc
     from nlp.dedup import embedding_index as _emb_idx
     from api.warmth import mark_warm as _mark_warm
 
     _load_encoder()
-    _nli._ensure_loaded()       # shared by classifier + geotagger
+    _nli._ensure_loaded()       # shared by /nli + geotagger
     _ner._ensure_loaded()
     _geo_svc.load()
-    _cls_svc.load()
     _dedup_svc.load()
     _emb_idx._ensure_loaded()
 
     _mark_warm("geotag")
-    _mark_warm("classify")
+    _mark_warm("nli")
     _mark_warm("dedup")
     _mark_warm("summarize")
     log.info("nlp-service ready")
@@ -65,7 +63,7 @@ def healthz() -> dict:
 
 @app.get("/readyz")
 def readyz(response: Response) -> dict:
-    expected = {"summarize", "geotag", "classify", "dedup"}
+    expected = {"summarize", "geotag", "nli", "dedup"}
     missing = get_missing(expected)
     if missing:
         response.status_code = 503
@@ -76,12 +74,12 @@ def readyz(response: Response) -> dict:
 def _register_routers() -> None:
     from api.routers import summarize as summarize_router
     from api.routers import geotag as geotag_router
-    from api.routers import classify as classify_router
+    from api.routers import nli as nli_router
     from api.routers import dedup as dedup_router
     from api.routers import ollama as ollama_router
     app.include_router(summarize_router.router)
     app.include_router(geotag_router.router)
-    app.include_router(classify_router.router)
+    app.include_router(nli_router.router)
     app.include_router(dedup_router.router)
     app.include_router(ollama_router.router)
 
