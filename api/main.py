@@ -25,12 +25,10 @@ async def lifespan(app: FastAPI):
     _flair_lib.device = torch.device(os.environ.get("NER_DEVICE", "cpu"))
 
     from nlp import nli as _nli
-    from nlp.encoder import load_encoder as _load_encoder
     from nlp.geotagger import ner as _ner
     from nlp.geotagger import service as _geo_svc
     from api.warmth import mark_warm as _mark_warm
 
-    _load_encoder()
     _nli._ensure_loaded()       # shared by /nli + geotagger
     _ner._ensure_loaded()
     _geo_svc.load()

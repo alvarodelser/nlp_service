@@ -15,10 +15,8 @@ RUN python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('s
 # Pre-pull NLP models so first request is fast (~2 GB total)
 # NER: Flair Spanish large (XLM-R + character LM, F1=90.54)
 RUN python -c "from flair.models import SequenceTagger; SequenceTagger.load('flair/ner-spanish-large')"
-# Relevance + scope + topic classification (NLI)
+# NLI: hypothesis scoring (nli) + geotagger typing/tie-break
 RUN python -c "from transformers import pipeline; pipeline('zero-shot-classification', model='Recognai/bert-base-spanish-wwm-cased-xnli')"
-# Dedup + semantic embeddings
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')"
 
 COPY . /app/
 
