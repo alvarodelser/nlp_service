@@ -9,6 +9,9 @@ services:
     environment:
       OLLAMA_HOST: ${OLLAMA_HOST}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
+      EXTRACTION_MODEL: ${EXTRACTION_MODEL:-gemma4:31b}
+      RESOLVE_MODEL: ${RESOLVE_MODEL:-gemma4:31b}
+      WEAVIATE_URL: ${WEAVIATE_URL:-http://weaviate:8080}
       DEDUP_LSH_THRESHOLD: "0.9"
       DEDUP_EMBED_THRESHOLD: "0.85"
       DEDUP_PERSIST_EVERY_N: "10"

@@ -1,0 +1,207 @@
+[
+  {
+    "id": "ner-001",
+    "description": "Person + organisation, one relation",
+    "input": {
+      "text": "Pedro Sánchez, presidente del Gobierno, se reunió ayer con la dirección del Partido Socialista Obrero Español para tratar la reforma fiscal.",
+      "schema": {
+        "entity_types": [
+          {"name": "PERSONA", "description": "Persona física nombrada en el texto."},
+          {"name": "ORGANIZACIÓN", "description": "Partido político, empresa, institución u organismo."}
+        ],
+        "relation_types": [
+          {
+            "name": "MIEMBRO_DE",
+            "description": "La persona pertenece o forma parte de la organización.",
+            "head_types": ["PERSONA"],
+            "tail_types": ["ORGANIZACIÓN"]
+          }
+        ]
+      }
+    },
+    "expected": {
+      "entities": [
+        {"type": "PERSONA",       "name": "Pedro Sánchez"},
+        {"type": "ORGANIZACIÓN",  "name": "Partido Socialista Obrero Español"}
+      ],
+      "relations": [
+        {"type": "MIEMBRO_DE", "head_type": "PERSONA", "tail_type": "ORGANIZACIÓN"}
+      ]
+    }
+  },
+  {
+    "id": "ner-002",
+    "description": "Entity subtype resolved from context",
+    "input": {
+      "text": "Amancio Ortega, fundador de Inditex, ha donado 320 millones de euros al sistema sanitario público español.",
+      "schema": {
+        "entity_types": [
+          {
+            "name": "PERSONA",
+            "description": "Persona física nombrada.",
+            "subtypes": [
+              {"name": "político",    "description": "Cargo o actividad política principal."},
+              {"name": "empresario",  "description": "Fundador, directivo o inversor de empresa."},
+              {"name": "deportista",  "description": "Deportista profesional."}
+            ]
+          },
+          {"name": "ORGANIZACIÓN", "description": "Empresa, institución u organismo."}
+        ],
+        "relation_types": [
+          {
+            "name": "FUNDÓ",
+            "description": "La persona creó o fundó la organización.",
+            "head_types": ["PERSONA"],
+            "tail_types": ["ORGANIZACIÓN"]
+          }
+        ]
+      }
+    },
+    "expected": {
+      "entities": [
+        {"type": "PERSONA",      "subtype": "empresario", "name": "Amancio Ortega"},
+        {"type": "ORGANIZACIÓN", "name": "Inditex"}
+      ],
+      "relations": [
+        {"type": "FUNDÓ", "head_type": "PERSONA", "tail_type": "ORGANIZACIÓN"}
+      ]
+    }
+  },
+  {
+    "id": "ner-003",
+    "description": "Event entity with date and place attributes",
+    "input": {
+      "text": "La Cumbre Iberoamericana se celebrará el 15 de noviembre en Santo Domingo y reunirá a jefes de Estado de 22 países.",
+      "schema": {
+        "entity_types": [
+          {
+            "name": "EVENTO",
+            "description": "Acto, reunión, cumbre o acontecimiento con nombre propio.",
+            "attributes": [
+              {"name": "fecha",  "datatype": "string", "description": "Fecha o período en que ocurre."},
+              {"name": "lugar",  "datatype": "string", "description": "Ciudad o país donde se celebra."}
+            ]
+          }
+        ],
+        "relation_types": []
+      }
+    },
+    "expected": {
+      "entities": [
+        {"type": "EVENTO", "name": "Cumbre Iberoamericana",
+         "attributes": {"fecha": "15 de noviembre", "lugar": "Santo Domingo"}}
+      ],
+      "relations": []
+    }
+  },
+  {
+    "id": "ner-004",
+    "description": "Two organisations, two typed relations from one person",
+    "input": {
+      "text": "Ana Botín dirige el Banco Santander desde 2014 y forma parte del consejo de administración de la Fundación Empresa y Sociedad.",
+      "schema": {
+        "entity_types": [
+          {"name": "PERSONA",       "description": "Persona física nombrada."},
+          {"name": "ORGANIZACIÓN",  "description": "Empresa, banco, fundación u organismo."}
+        ],
+        "relation_types": [
+          {
+            "name": "DIRIGE",
+            "description": "La persona ocupa el cargo directivo máximo de la organización.",
+            "head_types": ["PERSONA"],
+            "tail_types": ["ORGANIZACIÓN"]
+          },
+          {
+            "name": "MIEMBRO_DE",
+            "description": "La persona pertenece o forma parte de la organización.",
+            "head_types": ["PERSONA"],
+            "tail_types": ["ORGANIZACIÓN"]
+          }
+        ]
+      }
+    },
+    "expected": {
+      "entities": [
+        {"type": "PERSONA",      "name": "Ana Botín"},
+        {"type": "ORGANIZACIÓN", "name": "Banco Santander"},
+        {"type": "ORGANIZACIÓN", "name": "Fundación Empresa y Sociedad"}
+      ],
+      "relations": [
+        {"type": "DIRIGE",    "head_type": "PERSONA", "tail_type": "ORGANIZACIÓN"},
+        {"type": "MIEMBRO_DE","head_type": "PERSONA", "tail_type": "ORGANIZACIÓN"}
+      ]
+    }
+  },
+  {
+    "id": "ner-005",
+    "description": "Same entity mentioned twice — should produce one entity, not two",
+    "input": {
+      "text": "El ministro de Hacienda, Cristóbal Montoro, ha defendido la reforma tributaria. Montoro aseguró que los cambios entrarán en vigor en enero.",
+      "schema": {
+        "entity_types": [
+          {"name": "PERSONA",      "description": "Persona física nombrada."},
+          {"name": "ORGANIZACIÓN", "description": "Ministerio, partido u organismo público."}
+        ],
+        "relation_types": []
+      }
+    },
+    "expected": {
+      "entities": [
+        {"type": "PERSONA", "name": "Cristóbal Montoro"}
+      ],
+      "relations": [],
+      "notes": "Single entity despite two mentions"
+    }
+  },
+  {
+    "id": "ner-006",
+    "description": "No named entities in text — false-positive guard",
+    "input": {
+      "text": "Mañana se esperan lluvias en el norte de la península con temperaturas que no superarán los doce grados. En el sur el tiempo será soleado.",
+      "schema": {
+        "entity_types": [
+          {"name": "PERSONA",      "description": "Persona física nombrada."},
+          {"name": "ORGANIZACIÓN", "description": "Empresa, institución u organismo."}
+        ],
+        "relation_types": []
+      }
+    },
+    "expected": {
+      "entities": [],
+      "relations": []
+    }
+  },
+  {
+    "id": "ner-007",
+    "description": "Relation with attribute (acquisition amount)",
+    "input": {
+      "text": "Telefónica ha adquirido la compañía de ciberseguridad ElevenPaths por 200 millones de euros.",
+      "schema": {
+        "entity_types": [
+          {"name": "ORGANIZACIÓN", "description": "Empresa, corporación o sociedad mercantil."}
+        ],
+        "relation_types": [
+          {
+            "name": "ADQUIRIÓ",
+            "description": "Una organización compró o absorbió a otra.",
+            "head_types": ["ORGANIZACIÓN"],
+            "tail_types": ["ORGANIZACIÓN"],
+            "attributes": [
+              {"name": "importe_millones", "datatype": "number", "description": "Precio de la operación en millones de euros."}
+            ]
+          }
+        ]
+      }
+    },
+    "expected": {
+      "entities": [
+        {"type": "ORGANIZACIÓN", "name": "Telefónica"},
+        {"type": "ORGANIZACIÓN", "name": "ElevenPaths"}
+      ],
+      "relations": [
+        {"type": "ADQUIRIÓ", "head_type": "ORGANIZACIÓN", "tail_type": "ORGANIZACIÓN",
+         "attributes": {"importe_millones": 200}}
+      ]
+    }
+  }
+]

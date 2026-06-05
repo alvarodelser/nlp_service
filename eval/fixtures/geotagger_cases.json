@@ -4,7 +4,8 @@
     "description": "City + street within that city",
     "input": {
       "text": "El Ayuntamiento de Madrid ha aprobado las obras de remodelación de la Calle de Alcalá previstas para el próximo año.",
-      "headline": "Madrid remodela la Calle de Alcalá"    },
+      "headline": "Madrid remodela la Calle de Alcalá"
+    },
     "expected_places": [
       {"type": "city", "name": "Madrid"},
       {"type": "street", "city_name": "Madrid"}
@@ -15,7 +16,8 @@
     "description": "Region (comunidad autónoma)",
     "input": {
       "text": "La Junta de Andalucía ha presentado un nuevo plan de empleo que afectará a todas las provincias de la comunidad.",
-      "headline": "Andalucía presenta un plan de empleo"    },
+      "headline": "Andalucía presenta un plan de empleo"
+    },
     "expected_places": [
       {"type": "region", "name": "Andalucía"}
     ]
@@ -25,7 +27,8 @@
     "description": "Two cities mentioned; street should attach to the contextually dominant one",
     "input": {
       "text": "El tren conectará Valladolid con Madrid. Las obras en la Calle Mayor de Valladolid comenzarán en marzo.",
-      "headline": "Nueva línea entre Valladolid y Madrid"    },
+      "headline": "Nueva línea entre Valladolid y Madrid"
+    },
     "expected_places": [
       {"type": "city", "name": "Valladolid"},
       {"type": "city", "name": "Madrid"},
@@ -37,7 +40,76 @@
     "description": "National scope, no specific city (sanity: few/no city places)",
     "input": {
       "text": "El Gobierno de España ha aprobado una reforma de la ley de vivienda que entrará en vigor en todo el territorio nacional.",
-      "headline": "Nueva ley estatal de vivienda"    },
+      "headline": "Nueva ley estatal de vivienda"
+    },
+    "expected_places": []
+  },
+  {
+    "id": "geo-005",
+    "description": "Province mentioned alongside its region",
+    "input": {
+      "text": "La Diputación de Sevilla ha aprobado un presupuesto récord para infraestructuras en la provincia.",
+      "headline": "Sevilla refuerza sus infraestructuras provinciales"
+    },
+    "expected_places": [
+      {"type": "city", "name": "Sevilla"}
+    ]
+  },
+  {
+    "id": "geo-006",
+    "description": "Street with abbreviated prefix (Avda., Plaza, Paseo)",
+    "input": {
+      "text": "Los comercios de la Avda. de la Constitución en Sevilla exigen compensaciones por las obras.",
+      "headline": "Protestas en la Avda. de la Constitución de Sevilla"
+    },
+    "expected_places": [
+      {"type": "city", "name": "Sevilla"},
+      {"type": "street", "city_name": "Sevilla"}
+    ]
+  },
+  {
+    "id": "geo-007",
+    "description": "City in headline drives street imputation when text is ambiguous",
+    "input": {
+      "text": "El consistorio ha decidido peatonalizar el Paseo de Gracia a partir del próximo mes.",
+      "headline": "Barcelona peatonaliza el Paseo de Gracia"
+    },
+    "expected_places": [
+      {"type": "city", "name": "Barcelona"},
+      {"type": "street", "city_name": "Barcelona"}
+    ]
+  },
+  {
+    "id": "geo-008",
+    "description": "Ambiguous city name resolved by context (Valencia city vs region)",
+    "input": {
+      "text": "El alcalde de Valencia ha inaugurado el nuevo tramo del metro en la ciudad.",
+      "headline": "Valencia estrena nueva línea de metro"
+    },
+    "expected_places": [
+      {"type": "city", "name": "Valencia"}
+    ]
+  },
+  {
+    "id": "geo-009",
+    "description": "Multiple streets in the same city",
+    "input": {
+      "text": "Los cortes de tráfico afectarán a la Calle Serrano y al Paseo de la Castellana en Madrid durante todo el fin de semana.",
+      "headline": "Madrid corta el tráfico en Serrano y Castellana"
+    },
+    "expected_places": [
+      {"type": "city", "name": "Madrid"},
+      {"type": "street", "city_name": "Madrid"},
+      {"type": "street", "city_name": "Madrid"}
+    ]
+  },
+  {
+    "id": "geo-010",
+    "description": "No geographic content — no places expected (false-positive guard)",
+    "input": {
+      "text": "El presidente del Gobierno ha anunciado nuevas medidas fiscales para reducir el déficit público en los próximos ejercicios.",
+      "headline": "El Gobierno anuncia ajuste fiscal"
+    },
     "expected_places": []
   }
 ]

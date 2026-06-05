@@ -138,10 +138,10 @@ def _resolve_city(span: ner.Span, premise: str) -> GeoEntity | None:
         best = next(e for e in cands if e.name == result["labels"][0])
         conf = float(result["scores"][0])
     b4c = _b4c_city(best.name)
-    if not b4c:
-        return None                                   # no b4c city id → drop
     return GeoEntity(text=span.text, type="city", name=best.name,
-                     geonames_id=best.geonames_id, city_id=b4c["id"], city_name=b4c["name"],
+                     geonames_id=best.geonames_id,
+                     city_id=b4c["id"] if b4c else None,
+                     city_name=b4c["name"] if b4c else best.name,
                      lat=best.lat, lon=best.lon, confidence=conf)
 
 
@@ -149,6 +149,8 @@ def _resolve_street(span: ner.Span, detected: list[GeoEntity]) -> GeoEntity | No
     q = _street_query(span.text)
     matches: list[tuple[GeoEntity, list[int]]] = []
     for c in detected:                                # only the cities the article mentions
+        if c.city_id is None:
+            continue
         edge_ids = _edge_ids(cities_api.search_edges(c.city_id, q))
         if edge_ids:
             matches.append((c, edge_ids))
@@ -198,7 +200,8 @@ def run(text: str, headline: str = "", debug: bool = False) -> dict:
         if t == "city":
             place = _resolve_city(s, premise)
             if place:
-                places.append(place)
+                if place.city_id is not None:
+                    places.append(place)
                 if place.lat is not None:
                     detected_cities.append(place)
 
