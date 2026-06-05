@@ -38,9 +38,12 @@ def test_classify_multi_label_flag_passed():
     assert mock_pipe.call_args[1]["multi_label"] is True
 
 
-def test_classifier_model_still_works_via_shim():
-    mock_pipe = _make_mock_pipeline(["label"], [0.6])
+def test_score_short_circuits_on_first_below_threshold():
+    mock_pipe = MagicMock(side_effect=lambda text, candidate_labels, multi_label,
+                          hypothesis_template: {"labels": list(candidate_labels),
+                          "scores": [{"a": 0.9, "b": 0.2, "c": 0.8}[candidate_labels[0]]],
+                          "sequence": text})
     with patch("nlp.nli._pipeline", mock_pipe):
-        from nlp.classifier import model
-        result = model.classify("text", labels=["label"], multi_label=False)
-    assert result["labels"] == ["label"]
+        from nlp import nli
+        out = nli.score("t", ["a", "b", "c"], threshold=0.5)
+    assert [d["hypothesis"] for d in out] == ["a", "b"]   # stops at b (0.2 < 0.5); c not run
