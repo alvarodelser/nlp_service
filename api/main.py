@@ -41,7 +41,6 @@ async def lifespan(app: FastAPI):
     _dedup_svc.load()
     _emb_idx._ensure_loaded()
 
-    _mark_warm("extract")
     _mark_warm("geotag")
     _mark_warm("classify")
     _mark_warm("dedup")
@@ -66,7 +65,7 @@ def healthz() -> dict:
 
 @app.get("/readyz")
 def readyz(response: Response) -> dict:
-    expected = {"extract", "summarize", "geotag", "classify", "dedup"}
+    expected = {"summarize", "geotag", "classify", "dedup"}
     missing = get_missing(expected)
     if missing:
         response.status_code = 503
@@ -75,13 +74,11 @@ def readyz(response: Response) -> dict:
 
 
 def _register_routers() -> None:
-    from api.routers import extract as extract_router
     from api.routers import summarize as summarize_router
     from api.routers import geotag as geotag_router
     from api.routers import classify as classify_router
     from api.routers import dedup as dedup_router
     from api.routers import ollama as ollama_router
-    app.include_router(extract_router.router)
     app.include_router(summarize_router.router)
     app.include_router(geotag_router.router)
     app.include_router(classify_router.router)

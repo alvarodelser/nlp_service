@@ -1,0 +1,19 @@
+Escribe una descripción concisa y factual de la entidad, basada únicamente en la evidencia proporcionada.
+
+ENTIDAD
+=======
+Nombre: {name}
+Tipo: {type}
+{subtype_line}
+
+EVIDENCIA
+=========
+{evidence_text}
+
+REGLAS
+======
+- Máximo 2-4 frases.
+- Afirma solo lo que la evidencia respalde explícitamente. No especules.
+- Incluye los hechos y las relaciones que la evidencia confirme.
+- Escribe la descripción en español, sea cual sea el idioma de la evidencia.
+- Devuelve únicamente JSON con el campo "description".

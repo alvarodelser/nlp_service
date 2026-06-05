@@ -285,20 +285,39 @@ def _call_once(prompt: str, schema: dict, timeout: float) -> dict[str, Any]:
 
 ## Prompt templates
 
-`prompts/article.es.txt` is the renamed `rewrite.es.txt`, unchanged, with placeholders
-`{headline}` (the original `title`) and `{text}` (the body — note the placeholder name changes
-from `{extract}` to `{text}` because the reduced body now arrives in the `text` field).
+**Prompts are domain-neutral task scaffolds.** The module stores the *task* (rewrite a title +
+summarize, describe an entity/relation from evidence, merge descriptions) plus its output schema
+and length rules — but **no use-case framing**. No "news", "journalism", "knowledge graph", or
+financial/legal wording lives here; that would couple this agnostic module to one use case. If a
+future use case needs a persona/context, add a `{context}` slot fed by the orchestrator
+(hybrid) — not domain words baked into the module. (Extends the agnostic-module principle:
+`[[project_schema_variable]]`.)
 
-> Migration note: the article profile passes `title` as `{headline}` to the template. In
-> `_prepare_fields` the article fields are `{title, text}`; map `title → headline` for the
-> template, e.g. `prepared.setdefault("headline", prepared.get("title", ""))`. Keep the body
-> placeholder as `{text}` and delete the old `{extract}` placeholder from the renamed template.
+`prompts/article.es.txt` (renamed from `rewrite.es.txt`) — placeholders `{title}` (the original
+headline to rewrite) and `{text}` (the body; reduced by the extractive step when over budget).
+The article fields are `{title, text}`, used directly — no `title → headline` remapping.
+
+```
+Reescribe el titular y resume el contenido en español neutro.
+
+REQUISITOS:
+- El titular debe tener entre 8 y 15 palabras.
+- Elimina del titular los sufijos de la fuente (por ejemplo " - dominio.com" o " | Sección") si aparecen.
+- El resumen debe tener entre 2 y 4 frases.
+- No añadas información que no esté en el texto.
+- Devuelve únicamente JSON con los campos "headline" y "summary".
+
+TITULAR ORIGINAL:
+{title}
+
+TEXTO:
+{text}
+```
 
 `prompts/entity_desc.es.txt` (new):
 
 ```
-Estás manteniendo un grafo de conocimiento para periodismo de investigación.
-Escribe una descripción concisa y factual de la entidad, basada solo en la evidencia.
+Escribe una descripción concisa y factual de la entidad, basada únicamente en la evidencia proporcionada.
 
 ENTIDAD
 =======
@@ -306,26 +325,27 @@ Nombre: {name}
 Tipo: {type}
 {subtype_line}
 
-EVIDENCIA ACUMULADA
-===================
+EVIDENCIA
+=========
 {evidence_text}
 
 REGLAS
 ======
 - Máximo 2-4 frases.
 - Afirma solo lo que la evidencia respalde explícitamente. No especules.
-- Incluye relaciones, cargos y hechos financieros o legales confirmados.
+- Incluye los hechos y las relaciones que la evidencia confirme.
 - Escribe la descripción en español, sea cual sea el idioma de la evidencia.
+- Devuelve únicamente JSON con el campo "description".
 ```
 
-`prompts/relation_desc.es.txt` (new): same shape, header block reads `RELACIÓN` with
-`{head}`, `{tail}`, `{type}`, `{subtype_line}`, an `ATRIBUTOS` line for `{attributes}`, and the
-same `{evidence_text}` + rules.
+`prompts/relation_desc.es.txt` (new): same shape, header block `RELACIÓN` with `{head}`,
+`{tail}`, `{type}`, `{subtype_line}`, an `ATRIBUTOS` block for `{attributes}`, the same
+`{evidence_text}` + neutral rules.
 
-`prompts/aggregate.es.txt` (new): consolidates descriptions across documents. Header block
-gives `{name}`/`{type}`, an `DESCRIPCIONES PREVIAS` block for `{descriptions_text}`, the
-`{evidence_text}` block, and the same Spanish/no-speculation rules — the difference is the
-instruction to merge the prior descriptions into one coherent up-to-date description.
+`prompts/aggregate.es.txt` (new): merges prior descriptions of the same element across sources.
+Header block `{name}`/`{type}`, a `DESCRIPCIONES PREVIAS` block for `{descriptions_text}`, the
+`{evidence_text}` block, and neutral merge rules (integrate, drop repeats/contradictions, no
+speculation, Spanish).
 
 ---
 

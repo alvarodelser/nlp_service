@@ -22,14 +22,14 @@ _JSON_SCHEMA: dict = {
 }
 
 
-def _call_once(prompt: str, timeout: float) -> dict[str, Any]:
+def _call_once(prompt: str, schema: dict, timeout: float) -> dict[str, Any]:
     response = httpx.post(
         f"{OLLAMA_HOST}/api/generate",
         json={
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
-            "format": _JSON_SCHEMA,
+            "format": schema,
         },
         timeout=timeout,
     )
@@ -41,8 +41,13 @@ def _call_once(prompt: str, timeout: float) -> dict[str, Any]:
 _TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "120"))
 
 
-def generate(prompt: str, max_retries: int = 3, timeout: float = _TIMEOUT) -> dict[str, Any]:
-    """Forced-JSON Ollama call. Returns dict with `headline` and `summary` keys.
+def generate(
+    prompt: str,
+    schema: dict = _JSON_SCHEMA,
+    max_retries: int = 3,
+    timeout: float = _TIMEOUT,
+) -> dict[str, Any]:
+    """Forced-JSON Ollama call. `schema` constrains the output (defaults to the article schema).
 
     Raises the last httpx error if all retries fail.
     Raises ValueError if Ollama returns malformed JSON after all retries.
@@ -50,7 +55,7 @@ def generate(prompt: str, max_retries: int = 3, timeout: float = _TIMEOUT) -> di
     last_error: Exception | None = None
     for attempt in range(max_retries):
         try:
-            return _call_once(prompt, timeout)
+            return _call_once(prompt, schema, timeout)
         except (httpx.HTTPError, json.JSONDecodeError, KeyError) as exc:
             last_error = exc
             log.warning("ollama call failed (attempt %d/%d): %s", attempt + 1, max_retries, exc)

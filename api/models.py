@@ -2,33 +2,17 @@
 from pydantic import BaseModel, Field
 from typing import Literal
 
-# --- Extract ---
-
-class ExtractRequest(BaseModel):
-    article_id: str
-    text: str
-
-
-class ExtractResponse(BaseModel):
-    article_id: str
-    extract: str
-    embedding_raw: list[float]
-
-
 # --- Summarize ---
 
 class SummarizeRequest(BaseModel):
-    article_id: str
-    text: str
-    extract: str       # pre-computed by /extract
-    headline: str      # original headline to rewrite
+    request_id: str | None = None
+    profile:    str                 # "article" | "entity_desc" | "relation_desc" | "aggregate"
+    fields:     dict                # profile-specific; validated by the profile/prompt
 
 
 class SummarizeResponse(BaseModel):
-    article_id: str
-    headline: str
-    summary: str
-    embedding_summary: list[float]
+    request_id: str | None = None
+    result:     dict                # e.g. {"headline","summary"} or {"description"}
 
 
 # --- Geotag ---
