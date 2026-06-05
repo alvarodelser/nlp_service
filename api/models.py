@@ -25,6 +25,7 @@ class GeotagRequest(BaseModel):
     text:       str
     headline:   str = ""
     source:     str = ""
+    debug:      bool = False        # include per-stage `trace` in the response
 
 
 class GeoEntity(BaseModel):
@@ -44,6 +45,7 @@ class GeoEntity(BaseModel):
 class GeotagResponse(BaseModel):
     request_id: str | None = None
     places:     list[GeoEntity]
+    trace:      dict | None = None      # per-stage internals when debug=True
 
 
 # --- NER ---

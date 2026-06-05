@@ -217,7 +217,7 @@ def _resolve_location(span: ner.Span, detected: list[GeoEntity]) -> GeoEntity:
                      city_name=(near.city_name if near else None))
 
 
-def run(text: str, headline: str = "", source: str = "") -> dict:
+def run(text: str, headline: str = "", source: str = "", debug: bool = False) -> dict:
     load()
     premise = f"{headline}. {text}" if headline else text
     spans = ner.extract_spans(premise)
@@ -245,4 +245,16 @@ def run(text: str, headline: str = "", source: str = "") -> dict:
         if t == "location":
             places.append(_resolve_location(s, detected_cities))
 
-    return {"places": [p for p in places if p is not None]}
+    result = {"places": [p for p in places if p is not None]}
+    if debug:
+        result["trace"] = {
+            # stage 1 — raw NER + regex detection
+            "spans": [{"text": s.text, "label": s.label, "hint": s.hint,
+                       "start": s.start_char, "end": s.end_char} for s in spans],
+            # stage 2 — type assigned to each span (regex / gazetteer / nli fallback)
+            "typed": [{"text": s.text, "type": t} for s, t in typed],
+            # stage 3 context — cities used to impute streets/locations
+            "detected_cities": [{"city_id": d.city_id, "city_name": d.city_name,
+                                 "lat": d.lat, "lon": d.lon} for d in detected_cities],
+        }
+    return result

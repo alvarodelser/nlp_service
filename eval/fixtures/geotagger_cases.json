@@ -1,0 +1,51 @@
+[
+  {
+    "id": "geo-001",
+    "description": "City + street within that city",
+    "input": {
+      "text": "El Ayuntamiento de Madrid ha aprobado las obras de remodelación de la Calle de Alcalá previstas para el próximo año.",
+      "headline": "Madrid remodela la Calle de Alcalá",
+      "source": ""
+    },
+    "expected_places": [
+      {"type": "city", "name": "Madrid"},
+      {"type": "street", "city_name": "Madrid"}
+    ]
+  },
+  {
+    "id": "geo-002",
+    "description": "Region (comunidad autónoma)",
+    "input": {
+      "text": "La Junta de Andalucía ha presentado un nuevo plan de empleo que afectará a todas las provincias de la comunidad.",
+      "headline": "Andalucía presenta un plan de empleo",
+      "source": ""
+    },
+    "expected_places": [
+      {"type": "region", "name": "Andalucía"}
+    ]
+  },
+  {
+    "id": "geo-003",
+    "description": "Two cities mentioned; street should attach to the contextually dominant one",
+    "input": {
+      "text": "El tren conectará Valladolid con Madrid. Las obras en la Calle Mayor de Valladolid comenzarán en marzo.",
+      "headline": "Nueva línea entre Valladolid y Madrid",
+      "source": ""
+    },
+    "expected_places": [
+      {"type": "city", "name": "Valladolid"},
+      {"type": "city", "name": "Madrid"},
+      {"type": "street", "city_name": "Valladolid"}
+    ]
+  },
+  {
+    "id": "geo-004",
+    "description": "National scope, no specific city (sanity: few/no city places)",
+    "input": {
+      "text": "El Gobierno de España ha aprobado una reforma de la ley de vivienda que entrará en vigor en todo el territorio nacional.",
+      "headline": "Nueva ley estatal de vivienda",
+      "source": ""
+    },
+    "expected_places": []
+  }
+]
