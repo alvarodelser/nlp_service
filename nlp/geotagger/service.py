@@ -1,25 +1,15 @@
 from __future__ import annotations
 
-import json
 import logging
 import math
-import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from . import cities_api, gazetteer, ner
 from nlp import nli
 
 log = logging.getLogger("nlp_service.geotagger")
-
-_CITIES_PATH = Path(os.environ.get(
-    "CITIES_SNAPSHOT_PATH",
-    str(Path(__file__).parent / "data" / "cities_snapshot.json"),
-))
-_cities: list[dict] = []
-_by_id: dict[int, dict] = {}          # snapshot id -> city dict (source-prior name lookup)
 
 _CITY_TEMPLATE = "Este artículo describe principalmente hechos o iniciativas en {}."
 _MAX_CITY_CANDIDATES = 10
@@ -57,21 +47,8 @@ def _normalize(s: str) -> str:
                    if unicodedata.category(c) != "Mn")
 
 
-def _load_cities() -> None:
-    global _cities, _by_id
-    if _cities:
-        return
-    if not _CITIES_PATH.exists():
-        return
-    _cities = json.loads(_CITIES_PATH.read_text(encoding="utf-8"))
-    for c in _cities:
-        _by_id[c["id"]] = c
-
-
 def load() -> None:
     gazetteer.load()
-    gazetteer.load_source_prior()
-    _load_cities()
 
 
 # --- geometry helpers ---
@@ -138,20 +115,20 @@ def _type_span(span: ner.Span, premise: str) -> str:
 
 # --- resolution ---
 
-def _resolve_region(span: ner.Span) -> GeoEntity:
+def _resolve_region(span: ner.Span) -> GeoEntity | None:
     entries = [e for e in gazetteer.lookup(span.text) if e.feature_class == "A"]
     if not entries:
-        return GeoEntity(text=span.text, type="region")
+        return None                                   # not in gazetteer → drop
     best = max(entries, key=lambda e: e.population)
     return GeoEntity(text=span.text, type="region", name=best.name,
                      geonames_id=best.geonames_id, admin1_code=best.admin1_code,
                      lat=best.lat, lon=best.lon)
 
 
-def _resolve_city(span: ner.Span, premise: str) -> GeoEntity:
+def _resolve_city(span: ner.Span, premise: str) -> GeoEntity | None:
     entries = [e for e in gazetteer.lookup(span.text) if e.feature_class == "P"]
     if not entries:
-        return GeoEntity(text=span.text, type="city")
+        return None                                   # not in gazetteer → drop
     if len(entries) == 1:
         best, conf = entries[0], 1.0
     else:
@@ -161,42 +138,27 @@ def _resolve_city(span: ner.Span, premise: str) -> GeoEntity:
         best = next(e for e in cands if e.name == result["labels"][0])
         conf = float(result["scores"][0])
     b4c = _b4c_city(best.name)
+    if not b4c:
+        return None                                   # no b4c city id → drop
     return GeoEntity(text=span.text, type="city", name=best.name,
-                     geonames_id=best.geonames_id,
-                     city_id=(b4c["id"] if b4c else None),
-                     city_name=(b4c["name"] if b4c else best.name),
+                     geonames_id=best.geonames_id, city_id=b4c["id"], city_name=b4c["name"],
                      lat=best.lat, lon=best.lon, confidence=conf)
 
 
-def _resolve_street(span: ner.Span, source: str, detected: list[GeoEntity]) -> GeoEntity:
+def _resolve_street(span: ner.Span, detected: list[GeoEntity]) -> GeoEntity | None:
     q = _street_query(span.text)
-
-    candidates = [d for d in detected if d.city_id is not None]
-    if not candidates and source:
-        prior_id = gazetteer.get_city_prior(source)
-        snap = _by_id.get(prior_id) if prior_id is not None else None
-        b4c = _b4c_city(snap["name"]) if snap else None
-        if b4c:
-            candidates = [GeoEntity(text=snap["name"], type="city", city_id=b4c["id"],
-                                    city_name=b4c["name"], lat=snap.get("lat"),
-                                    lon=snap.get("lon"))]
-
     matches: list[tuple[GeoEntity, list[int]]] = []
-    for c in candidates:
-        try:
-            edge_ids = _edge_ids(cities_api.search_edges(c.city_id, q))
-        except Exception as exc:                 # noqa: BLE001 — unresolved is acceptable
-            log.warning("b4c edge search failed (city=%s, q=%r): %s", c.city_id, q, exc)
-            continue
+    for c in detected:                                # only the cities the article mentions
+        edge_ids = _edge_ids(cities_api.search_edges(c.city_id, q))
         if edge_ids:
             matches.append((c, edge_ids))
 
     if not matches:
-        return GeoEntity(text=span.text, type="street")
+        return None                                   # not found in any mentioned city → drop
     if len(matches) == 1:
         c, edge_ids = matches[0]
-    else:
-        pts = [(d.lat, d.lon) for d in detected if d.lat is not None and d.lon is not None]
+    else:                                             # closest to the detected-city cluster
+        pts = [(d.lat, d.lon) for d in detected if d.lat is not None]
         ref_lat = sum(p[0] for p in pts) / len(pts)
         ref_lon = sum(p[1] for p in pts) / len(pts)
         c, edge_ids = min(matches, key=lambda m: _haversine(m[0].lat, m[0].lon, ref_lat, ref_lon))
@@ -205,10 +167,10 @@ def _resolve_street(span: ner.Span, source: str, detected: list[GeoEntity]) -> G
                      city_name=c.city_name, edge_ids=edge_ids)
 
 
-def _resolve_location(span: ner.Span, detected: list[GeoEntity]) -> GeoEntity:
+def _resolve_location(span: ner.Span, detected: list[GeoEntity]) -> GeoEntity | None:
     points = [e for e in gazetteer.lookup(span.text) if e.feature_class == "P"]
     if not points:
-        return GeoEntity(text=span.text, type="location")
+        return None                                   # no gazetteer coords → drop
     best = max(points, key=lambda e: e.population)
     near = _nearest_city_to_point(best.lat, best.lon, detected)
     return GeoEntity(text=span.text, type="location", name=best.name,
@@ -217,7 +179,7 @@ def _resolve_location(span: ner.Span, detected: list[GeoEntity]) -> GeoEntity:
                      city_name=(near.city_name if near else None))
 
 
-def run(text: str, headline: str = "", source: str = "", debug: bool = False) -> dict:
+def run(text: str, headline: str = "", debug: bool = False) -> dict:
     load()
     premise = f"{headline}. {text}" if headline else text
     spans = ner.extract_spans(premise)
@@ -228,24 +190,31 @@ def run(text: str, headline: str = "", source: str = "", debug: bool = False) ->
 
     for s, t in typed:
         if t == "region":
-            places.append(_resolve_region(s))
+            place = _resolve_region(s)
+            if place:
+                places.append(place)
 
     for s, t in typed:
         if t == "city":
             place = _resolve_city(s, premise)
-            places.append(place)
-            if place.city_id is not None and place.lat is not None:
-                detected_cities.append(place)
+            if place:
+                places.append(place)
+                if place.lat is not None:
+                    detected_cities.append(place)
 
     for s, t in typed:
         if t == "street":
-            places.append(_resolve_street(s, source, detected_cities))
+            place = _resolve_street(s, detected_cities)
+            if place:
+                places.append(place)
 
     for s, t in typed:
         if t == "location":
-            places.append(_resolve_location(s, detected_cities))
+            place = _resolve_location(s, detected_cities)
+            if place:
+                places.append(place)
 
-    result = {"places": [p for p in places if p is not None]}
+    result = {"places": places}
     if debug:
         result["trace"] = {
             # stage 1 — raw NER + regex detection

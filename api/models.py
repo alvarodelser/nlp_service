@@ -24,7 +24,6 @@ class GeotagRequest(BaseModel):
     request_id: str | None = None
     text:       str
     headline:   str = ""
-    source:     str = ""
     debug:      bool = False        # include per-stage `trace` in the response
 
 

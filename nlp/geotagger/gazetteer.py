@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import csv
-import json
-import os
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -64,24 +62,5 @@ def lookup(span_text: str) -> list[GeoEntry]:
     load()
     return _entries.get(_normalize(span_text), [])
 
-
-# Streets now resolve via the b4c cities API (nlp/geotagger/cities_api.py), not a local index.
-_SOURCE_PRIOR_PATH = Path(os.environ.get(
-    "SOURCE_PRIOR_PATH",
-    Path(__file__).parent.parent.parent / "config" / "source_city_prior.json",
-))
-
-_source_prior: dict = {}                               # {source_name: city_id or None}
-
-
-def load_source_prior() -> None:
-    global _source_prior
-    if _source_prior:
-        return
-    if _SOURCE_PRIOR_PATH.exists():
-        _source_prior = json.loads(_SOURCE_PRIOR_PATH.read_text(encoding="utf-8"))
-
-
-def get_city_prior(source_name: str) -> int | None:
-    """Return city_id prior for a known source, or None."""
-    return _source_prior.get(source_name)
+# Streets resolve via the b4c cities API (nlp/geotagger/cities_api.py) within the cities the
+# article mentions. No source-prior fallback: an unresolved toponym is simply dropped.
