@@ -326,7 +326,7 @@ clusters, so a failed consolidation can simply be re-invoked.
 | `ONTOLOGY_DIR` | `config/ontologies` | Ontology YAML directory |
 | `VECTORIZER_URL` | `http://vectorizer:8000/embed` | bge-m3 embedding service |
 | `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` | — | Neo4j connection |
-| `WEAVIATE_HTTP_HOST` / `WEAVIATE_GRPC_HOST` | `weaviate` | Weaviate (shared) |
+| `WEAVIATE_URL` | `http://weaviate:8080` | Weaviate HTTP (REST + GraphQL via httpx; shared) |
 | `RELATIONS_CHUNK_TOKENS` | `512` | Chunk size for `chunker.split` |
 
 Module env (extraction/resolve/summarize models, dedup corpus thresholds) is owned by docs 04–06.
@@ -336,5 +336,5 @@ Module env (extraction/resolve/summarize models, dedup corpus thresholds) is own
 ## Dependencies
 
 - Modules: `nlp.ner`, `nlp.resolver`, `nlp.summarizer`, `nlp.dedup` (docs 04, 05, 01, 06).
-- `weaviate-client>=4`, `neo4j` (**new package**), `httpx`, `pyyaml`.
+- `httpx` (Weaviate REST + GraphQL — no `weaviate-client`), `neo4j` (**new package**), `pyyaml`.
 - External `vectorizer` (bge-m3) + Ollama sidecar.

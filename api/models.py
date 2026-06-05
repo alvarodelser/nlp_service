@@ -87,34 +87,38 @@ class NliResponse(BaseModel):
 
 # --- Dedup ---
 
-class DedupRequest(BaseModel):
-    article_id: str
-    text: str
+class DedupItemRequest(BaseModel):
+    request_id:       str | None = None
+    collection:       str
+    embedding:        list[float]
+    kind:             str = "article"      # article | entity | relation (LLM prompt flavour)
+    compare_text:     str = ""             # new item's comparable text (for the LLM step)
+    compare_property: str = "summary"      # stored property read for candidates
+    type_filter:      str | None = None    # restrict candidates by `type`
 
 
-class DedupCheckEmbedRequest(BaseModel):
-    article_id: str
-    embedding_raw: list[float]
+class Candidate(BaseModel):
+    id:    str
+    score: float
+    props: dict
 
 
-class DedupResponse(BaseModel):
-    article_id: str
-    duplicate_of: str | None
-    stage: Literal["minhash", "embedding"] | None = None
-    score: float | None = None
-    indexed: bool
+class DedupItemResponse(BaseModel):
+    request_id: str | None = None
+    decision:   Literal["match", "no_match"]
+    target_id:  str | None
+    score:      float
+    candidates: list[Candidate]
 
 
-class BootstrapArticle(BaseModel):
-    article_id: str
-    text: str
+class DedupCorpusRequest(BaseModel):
+    request_id:       str | None = None
+    collection:       str
+    kind:             str = "entity"
+    compare_property: str = "description"
+    type_filter:      str | None = None
 
 
-class BootstrapRequest(BaseModel):
-    articles: list[BootstrapArticle]
-
-
-class BootstrapResponse(BaseModel):
-    processed: int
-    duplicates_found: int
-    indexed: int
+class DedupCorpusResponse(BaseModel):
+    request_id: str | None = None
+    clusters:   list[list[str]]            # each inner list = one cluster of object ids

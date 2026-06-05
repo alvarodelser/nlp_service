@@ -35,7 +35,7 @@ vectors already stored in the collection.
 | `nlp/dedup/id_map.py` | **Deleted** (FAISS row mapping no longer needed) |
 | `nlp/dedup/persistence.py` | **Deleted** (no local pickled state) |
 | `nlp/dedup/service.py` — `check`, `check_minhash_only`, `check_embedding_vec`, `bootstrap`, `load`, `flush` | **Deleted** (minhash → orchestrator; embedding → `/dedup/item`) |
-| `nlp/dedup/weaviate_index.py` | **New** — Weaviate near-vector query wrapper |
+| `nlp/dedup/weaviate_index.py` | **New** — httpx REST/GraphQL near-vector + scan wrapper |
 | `nlp/dedup/item.py` | **New** — single-item 2-step decision |
 | `nlp/dedup/corpus.py` | **New** — collection clustering |
 | `nlp/dedup/llm.py` | **New** — LLM adjudication (shared by item + corpus) |
@@ -45,7 +45,7 @@ vectors already stored in the collection.
 | `api/models.py` — `DedupRequest`, `DedupCheckEmbedRequest`, `DedupResponse`, `Bootstrap*` | **Deleted** |
 | `api/models.py` — `DedupItem*`, `DedupCorpus*`, `Candidate` | **New** |
 | `api/main.py` warmup | Drop dedup `load()`/FAISS warmup + SIGTERM `flush()`; nothing to preload |
-| `requirements.txt` | **Add** `weaviate-client>=4`; **remove** `faiss-cpu` if unused elsewhere |
+| `requirements.txt` | **Remove** `faiss-cpu` (Weaviate reached via existing `httpx`; no new dep) |
 
 > The earlier entity-disambiguation sketch (a Weaviate candidate index + tiered thresholds + LLM
 > adjudication) is **generalised** here into `/dedup/item` (any collection) and `/dedup/corpus`,
@@ -120,56 +120,92 @@ or embedding work.
 
 ## Weaviate query wrapper (`nlp/dedup/weaviate_index.py`)
 
+Plain **httpx against Weaviate's HTTP API** (REST + GraphQL) on a single port via `WEAVIATE_URL`
+— the same "httpx → sidecar on the bridge network" pattern the repo uses for Ollama/the
+vectorizer. **No `weaviate-client`, no gRPC.** Near-vector search is GraphQL `nearVector`; full
+scans use the GraphQL cursor (`after`). The module is read-only; the orchestrators own writes.
+
 ```python
 import os
-import weaviate
-from weaviate.classes.query import Filter, MetadataQuery
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+import httpx
+
+WEAVIATE_URL     = os.environ.get("WEAVIATE_URL", "http://weaviate:8080").rstrip("/")
+WEAVIATE_TIMEOUT = float(os.environ.get("WEAVIATE_TIMEOUT", "30"))
+
 
 @dataclass
 class Candidate:
     id:    str
     score: float                 # cosine similarity (1 - distance)
-    props: dict                  # returned properties (e.g. canonical_name, description, summary)
+    props: dict
+
+
+@dataclass
+class FetchedObject:
+    id:     str
+    vector: list[float]
+    props:  dict = field(default_factory=dict)
 
 
 class WeaviateIndex:
-    """Read-only nearest-neighbour access to one Weaviate collection."""
+    """Read-only nearest-neighbour + full-scan access to one Weaviate collection over HTTP."""
 
-    def __init__(self, collection: str, client=None) -> None:
+    def __init__(self, collection: str, base_url: str | None = None, client=None) -> None:
         self.collection = collection
-        self._client = client or _get_client()
+        self._base = (base_url or WEAVIATE_URL).rstrip("/")
+        self._client = client or httpx.Client(timeout=WEAVIATE_TIMEOUT)
 
-    def near(self, embedding, top_k, filters=None, return_props=()) -> list[Candidate]:
-        res = self._client.collections.get(self.collection).query.near_vector(
-            near_vector=embedding, limit=top_k, filters=filters,
-            return_properties=list(return_props), return_metadata=MetadataQuery(distance=True),
-            include_vector=False,
-        )
-        return [Candidate(id=str(o.uuid), score=1.0 - o.metadata.distance, props=o.properties)
-                for o in res.objects]
+    def _graphql(self, query: str) -> list[dict]:
+        r = self._client.post(f"{self._base}/v1/graphql", json={"query": query})
+        r.raise_for_status()
+        body = r.json()
+        if body.get("errors"):
+            raise RuntimeError(f"weaviate graphql error: {body['errors']}")
+        return body["data"]["Get"][self.collection] or []
 
-    def fetch_all(self, filters=None, return_props=(), with_vector=True):
-        """Iterate every object (optionally filtered) — for corpus clustering."""
-        coll = self._client.collections.get(self.collection)
-        for o in coll.iterator(include_vector=with_vector,
-                               return_properties=list(return_props)):
-            yield o   # o.uuid, o.properties, o.vector
+    @staticmethod
+    def _where(type_filter):
+        return (f', where: {{path:["type"], operator:Equal, valueText:"{type_filter}"}}'
+                if type_filter else "")
 
+    def near(self, embedding, top_k, type_filter=None, return_props=()):
+        props = " ".join(return_props)
+        vec = ",".join(repr(float(x)) for x in embedding)
+        q = (f'{{ Get {{ {self.collection}('
+             f'nearVector: {{vector: [{vec}]}}, limit: {top_k}{self._where(type_filter)}) '
+             f'{{ {props} _additional {{ id distance }} }} }} }}')
+        return [Candidate(id=o["_additional"]["id"],
+                          score=1.0 - o["_additional"]["distance"],
+                          props={k: o.get(k) for k in return_props})
+                for o in self._graphql(q)]
 
-def _get_client():
-    return weaviate.connect_to_custom(
-        http_host=os.environ.get("WEAVIATE_HTTP_HOST", "weaviate"),
-        http_port=int(os.environ.get("WEAVIATE_HTTP_PORT", "8080")),
-        http_secure=False,
-        grpc_host=os.environ.get("WEAVIATE_GRPC_HOST", "weaviate"),
-        grpc_port=int(os.environ.get("WEAVIATE_GRPC_PORT", "50051")),
-        grpc_secure=False,
-    )
+    def fetch_all(self, return_props=(), with_vector=True, page=200):
+        props = " ".join(return_props)
+        add = "id vector" if with_vector else "id"
+        after = None
+        while True:
+            cursor = f', after: "{after}"' if after else ""
+            q = (f'{{ Get {{ {self.collection}(limit: {page}{cursor}) '
+                 f'{{ {props} _additional {{ {add} }} }} }} }}')
+            objs = self._graphql(q)
+            if not objs:
+                break
+            for o in objs:
+                yield FetchedObject(id=o["_additional"]["id"],
+                                    vector=o["_additional"].get("vector") or [],
+                                    props={k: o.get(k) for k in return_props})
+            after = objs[-1]["_additional"]["id"]
+            if len(objs) < page:
+                break
 ```
 
-The client is injectable so tests pass a fake. A type/scope filter is built with
-`Filter.by_property("type").equal(...)` by the caller.
+`near()` applies the `type_filter` as a GraphQL `where` (cheap on a bounded query). `fetch_all()`
+uses the cursor (`after`) for a clean full scan and does **not** combine `where` with the cursor;
+`corpus.cluster` filters by type client-side when a `type_filter` is given (and when entities and
+relations live in separate collections, no filter is needed at all). The httpx client is
+injectable so tests pass a fake.
 
 ---
 
@@ -189,8 +225,8 @@ class ItemDecision:
 
 
 def decide_item(index, embedding, *, kind, compare_text, compare_property,
-                match_threshold, llm_low, top_k, filters=None, llm=True) -> ItemDecision:
-    cands = index.near(embedding, top_k, filters=filters,
+                match_threshold, llm_low, top_k, type_filter=None, llm=True) -> ItemDecision:
+    cands = index.near(embedding, top_k, type_filter=type_filter,
                        return_props=(compare_property,))
     if not cands:
         return ItemDecision("no_match", None, 0.0, [])
@@ -208,7 +244,7 @@ def decide_item(index, embedding, *, kind, compare_text, compare_property,
 ```
 
 For the news pipeline: `kind="article"`, `compare_property="summary"`, `compare_text` is the new
-article's `headline + summary`, `filters=None`. The decision is binary (no "review" queue — the
+article's `headline + summary`, `type_filter=None`. The decision is binary (no "review" queue — the
 news pipeline either merges into the matched article or continues). The orchestrator performs the
 merge (append source+url, oldest date) on `match`.
 
@@ -216,26 +252,30 @@ merge (append source+url, oldest date) on `match`.
 
 ```python
 # nlp/dedup/corpus.py
-def cluster(index, *, kind, compare_property, merge_threshold, llm_low, top_k, filters=None,
+def cluster(index, *, kind, compare_property, merge_threshold, llm_low, top_k, type_filter=None,
             llm=True) -> list[list[str]]:
     """Union-find over near-neighbour edges. Returns clusters of object ids (singletons included)."""
-    objs = list(index.fetch_all(filters=filters, return_props=(compare_property,), with_vector=True))
-    uf = _UnionFind(o.uuid for o in objs)
+    rp = (compare_property,) + (("type",) if type_filter else ())
+    objs = [o for o in index.fetch_all(return_props=rp, with_vector=True)
+            if not type_filter or o.props.get("type") == type_filter]   # type filtered client-side
+    uf = _UnionFind(o.id for o in objs)
 
     for o in objs:
-        for cand in index.near(o.vector, top_k, filters=filters, return_props=(compare_property,)):
-            if cand.id == str(o.uuid):
+        for cand in index.near(o.vector, top_k, type_filter=type_filter,
+                               return_props=(compare_property,)):
+            if cand.id == o.id:
                 continue
             if cand.score >= merge_threshold:                       # auto-merge
-                uf.union(str(o.uuid), cand.id)
+                uf.union(o.id, cand.id)
             elif cand.score >= llm_low and llm:                     # mid band → LLM
-                if adjudicate(kind, o.properties.get(compare_property, ""),
+                if adjudicate(kind, o.props.get(compare_property, ""),
                               cand.props.get(compare_property, "")) == "yes":
-                    uf.union(str(o.uuid), cand.id)
+                    uf.union(o.id, cand.id)
     return uf.groups()
 ```
 
-Run once with `filters` selecting **entities**, once selecting **relations** (doc 08). Returns
+Run once selecting **entities**, once selecting **relations** (doc 08; usually separate
+collections, so `type_filter` is optional). Returns
 clusters (lists of Weaviate ids); the orchestrator merges each cluster and re-describes it with
 `summarizer[aggregate]`. `_UnionFind` is a tiny pure-Python helper (`find`/`union`/`groups`).
 
@@ -263,20 +303,18 @@ summary, entity name+description, relation evidence) so the module stays agnosti
 def dedup_item(collection, embedding, *, kind, compare_text, compare_property="summary",
                type_filter=None) -> dict:
     idx = WeaviateIndex(collection)
-    filters = Filter.by_property("type").equal(type_filter) if type_filter else None
     d = decide_item(idx, embedding, kind=kind, compare_text=compare_text,
                     compare_property=compare_property,
                     match_threshold=_ITEM_MATCH, llm_low=_ITEM_LLM_LOW,
-                    top_k=_TOP_K, filters=filters)
+                    top_k=_TOP_K, type_filter=type_filter)
     return {"decision": d.decision, "target_id": d.target_id, "score": d.score,
             "candidates": [vars(c) for c in d.candidates]}
 
-def dedup_corpus(collection, *, kind, compare_property, type_filter) -> dict:
+def dedup_corpus(collection, *, kind, compare_property, type_filter=None) -> dict:
     idx = WeaviateIndex(collection)
-    filters = Filter.by_property("type").equal(type_filter) if type_filter else None
     clusters = cluster(idx, kind=kind, compare_property=compare_property,
                        merge_threshold=_CORPUS_MERGE, llm_low=_CORPUS_LLM_LOW,
-                       top_k=_TOP_K, filters=filters)
+                       top_k=_TOP_K, type_filter=type_filter)
     return {"clusters": clusters}
 ```
 
@@ -341,8 +379,8 @@ class DedupCorpusResponse(BaseModel):
 | `DEDUP_CORPUS_LLM_LOW` | `0.80` | Mid-band edge → LLM check |
 | `DEDUP_TOP_K` | `10` | Neighbours fetched per query |
 | `MINHASH_NUM_PERM` | `128` | MinHash permutations (orchestrator's signature length) |
-| `WEAVIATE_HTTP_HOST` / `WEAVIATE_HTTP_PORT` | `weaviate` / `8080` | Weaviate HTTP |
-| `WEAVIATE_GRPC_HOST` / `WEAVIATE_GRPC_PORT` | `weaviate` / `50051` | Weaviate gRPC |
+| `WEAVIATE_URL` | `http://weaviate:8080` | Weaviate HTTP endpoint (REST + GraphQL), like `OLLAMA_HOST` |
+| `WEAVIATE_TIMEOUT` | `30` | Seconds per Weaviate HTTP call |
 | `EXTRACTION_MODEL` | `qwen2.5:32b` | LLM for adjudication |
 
 Removed: `DEDUP_PERSIST_EVERY_N`, `DEDUP_LSH_THRESHOLD`, FAISS/embedding env (local index gone).
@@ -351,7 +389,8 @@ Removed: `DEDUP_PERSIST_EVERY_N`, `DEDUP_LSH_THRESHOLD`, FAISS/embedding env (lo
 
 ## Dependencies
 
-- `weaviate-client>=4` — **new package** (item queries + corpus iteration).
+- `httpx` — already in requirements (Weaviate REST + GraphQL over HTTP; **no `weaviate-client`,
+  no gRPC** — matches the Ollama/vectorizer pattern on `b4c-net`).
 - `datasketch` — already in requirements (MinHash primitive).
 - Ollama sidecar — LLM adjudication.
-- Remove `faiss-cpu` from requirements if nothing else uses it.
+- Remove `faiss-cpu` from requirements (the FAISS path is retired).

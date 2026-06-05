@@ -1,145 +1,32 @@
 # nlp_service/nlp/dedup/service.py
-import logging
 import os
-import threading
 
-import numpy as np
+from .corpus import cluster
+from .item import decide_item
+from .weaviate_index import WeaviateIndex
 
-from . import persistence
-
-log = logging.getLogger(__name__)
-
-_PERSIST_EVERY_N = int(os.environ.get("DEDUP_PERSIST_EVERY_N", "10"))
-
-_mh = None
-_emb = None
-_ids = None
-_indexings_since_flush = 0
-_lock = threading.Lock()
+_ITEM_MATCH     = float(os.environ.get("DEDUP_ITEM_MATCH", "0.92"))
+_ITEM_LLM_LOW   = float(os.environ.get("DEDUP_ITEM_LLM_LOW", "0.75"))
+_CORPUS_MERGE   = float(os.environ.get("DEDUP_CORPUS_MERGE", "0.92"))
+_CORPUS_LLM_LOW = float(os.environ.get("DEDUP_CORPUS_LLM_LOW", "0.80"))
+_TOP_K          = int(os.environ.get("DEDUP_TOP_K", "10"))
 
 
-def load() -> None:
-    global _mh, _emb, _ids
-    if _mh is None:
-        _mh, _emb, _ids = persistence.load_all()
+def dedup_item(collection, embedding, *, kind="article", compare_text="",
+               compare_property="summary", type_filter=None) -> dict:
+    idx = WeaviateIndex(collection)
+    d = decide_item(idx, embedding, kind=kind, compare_text=compare_text,
+                    compare_property=compare_property,
+                    match_threshold=_ITEM_MATCH, llm_low=_ITEM_LLM_LOW,
+                    top_k=_TOP_K, type_filter=type_filter)
+    return {"decision": d.decision, "target_id": d.target_id, "score": d.score,
+            "candidates": [vars(c) for c in d.candidates]}
 
 
-def flush() -> None:
-    """Explicit flush — also called from the SIGTERM handler."""
-    if _mh is not None and _emb is not None and _ids is not None:
-        persistence.save_all(_mh, _emb, _ids)
-
-
-def _maybe_flush() -> None:
-    global _indexings_since_flush
-    _indexings_since_flush += 1
-    if _indexings_since_flush >= _PERSIST_EVERY_N:
-        try:
-            flush()
-        except Exception:
-            log.exception("periodic dedup flush failed; will retry next cycle")
-        else:
-            _indexings_since_flush = 0
-
-
-def check_minhash_only(article_id: str, text: str) -> dict:
-    """Stage 1 (pipeline step 1): MinHash check only. Adds to minhash index on miss."""
-    load()
-    with _lock:
-        assert _mh is not None and _ids is not None
-
-        if _ids.has(article_id):
-            return {"duplicate_of": article_id, "stage": "minhash", "score": 1.0,
-                    "indexed": False}
-
-        best_aid, best_jaccard = _mh.query(text)
-        if best_aid is not None and best_jaccard >= _mh.threshold:
-            return {"duplicate_of": best_aid, "stage": "minhash",
-                    "score": float(best_jaccard), "indexed": False}
-
-        _mh.add(article_id, text)
-        _maybe_flush()
-        return {"duplicate_of": None, "stage": None, "score": None, "indexed": True}
-
-
-def check_embedding_vec(article_id: str, vec: np.ndarray) -> dict:
-    """Stage 2 (pipeline step 3): Embedding check with pre-computed vector from /extract.
-    Adds to FAISS index on miss. article_id must already be in minhash index.
-    """
-    load()
-    with _lock:
-        assert _emb is not None and _ids is not None
-
-        best_row, best_cosine = _emb.query_vec(vec)
-        if best_row is not None and best_cosine >= _emb.threshold:
-            dup_aid = _ids.article_id_for(best_row)
-            if dup_aid is None:
-                log.error("FAISS row %d has no IdMap entry; index may be corrupt", best_row)
-                raise RuntimeError(f"dedup index inconsistency: row {best_row} unmapped")
-            return {"duplicate_of": dup_aid, "stage": "embedding",
-                    "score": float(best_cosine), "indexed": False}
-
-        emb_row = _emb.add_vec(vec)
-        mapped_row = _ids.add(article_id)
-        assert emb_row == mapped_row, "IdMap and FAISS row counters drifted apart"
-        _maybe_flush()
-        return {"duplicate_of": None, "stage": None, "score": None, "indexed": True}
-
-
-def check(article_id: str, text: str) -> dict:
-    """Returns the DedupResponse payload as a plain dict."""
-    load()
-    with _lock:
-        assert _mh is not None and _emb is not None and _ids is not None
-
-        # Already seen — treat as duplicate of itself (don't re-add).
-        if _ids.has(article_id):
-            return {"duplicate_of": article_id, "stage": "minhash", "score": 1.0,
-                    "indexed": False}
-
-        # Stage 1: MinHash LSH
-        best_aid, best_jaccard = _mh.query(text)
-        if best_aid is not None and best_jaccard >= _mh.threshold:
-            return {"duplicate_of": best_aid, "stage": "minhash",
-                    "score": float(best_jaccard), "indexed": False}
-
-        # Stage 2: Embedding
-        best_row, best_cosine = _emb.query(text)
-        if best_row is not None and best_cosine >= _emb.threshold:
-            dup_aid = _ids.article_id_for(best_row)
-            if dup_aid is None:
-                log.error("FAISS row %d has no IdMap entry; index may be corrupt", best_row)
-                raise RuntimeError(f"dedup index inconsistency: row {best_row} unmapped")
-            return {"duplicate_of": dup_aid, "stage": "embedding",
-                    "score": float(best_cosine), "indexed": False}
-
-        # Not a duplicate — index it.
-        _mh.add(article_id, text)
-        _emb_row = _emb.add(text)
-        mapped_row = _ids.add(article_id)
-        assert _emb_row == mapped_row, "IdMap and FAISS row counters drifted apart"
-        _maybe_flush()
-        return {"duplicate_of": None, "stage": None, "score": None, "indexed": True}
-
-
-def bootstrap(articles: list[dict]) -> dict:
-    """Rebuild indexes from a list of {article_id, text}."""
-    global _mh, _emb, _ids, _indexings_since_flush
-    from . import minhash_index, embedding_index, id_map
-    with _lock:
-        _mh = minhash_index.MinHashIndex()
-        _emb = embedding_index.EmbeddingIndex()
-        _ids = id_map.IdMap()
-        _indexings_since_flush = 0
-    duplicates_found = 0
-    indexed = 0
-    for art in articles:
-        result = check(art["article_id"], art["text"])
-        if result["duplicate_of"] is not None:
-            duplicates_found += 1
-        if result["indexed"]:
-            indexed += 1
-    flush()
-    with _lock:
-        _indexings_since_flush = 0
-    return {"processed": len(articles), "duplicates_found": duplicates_found, "indexed": indexed}
+def dedup_corpus(collection, *, kind="entity", compare_property="description",
+                 type_filter=None) -> dict:
+    idx = WeaviateIndex(collection)
+    clusters = cluster(idx, kind=kind, compare_property=compare_property,
+                       merge_threshold=_CORPUS_MERGE, llm_low=_CORPUS_LLM_LOW,
+                       top_k=_TOP_K, type_filter=type_filter)
+    return {"clusters": clusters}

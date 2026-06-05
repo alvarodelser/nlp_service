@@ -375,7 +375,7 @@ The orchestrator is the only stateful actor, and it performs exactly one termina
 | `NEWS_MINHASH_THRESHOLD` | `0.9` | Jaccard cut for MinHash duplicate |
 | `NEWS_MINHASH_WINDOW` | `5000` | Candidate signatures scanned per check |
 | `VECTORIZER_URL` | `http://vectorizer:8000/embed` | bge-m3 embedding service |
-| `WEAVIATE_HTTP_HOST` / `WEAVIATE_GRPC_HOST` | `weaviate` | Weaviate (shared with dedup, doc 06) |
+| `WEAVIATE_URL` | `http://weaviate:8080` | Weaviate HTTP (REST + GraphQL via httpx; shared with dedup, doc 06) |
 
 Module env vars (Ollama model/timeouts, `NLI_MODEL`, `B4C_API_BASE`, dedup thresholds) are owned
 by their modules (docs 01–06).
@@ -385,6 +385,6 @@ by their modules (docs 01–06).
 ## Dependencies
 
 - Modules: `nlp.summarizer`, `nlp.nli`, `nlp.geotagger`, `nlp.dedup` (docs 01–06).
-- `weaviate-client>=4` (shared with dedup), `httpx`, `pyyaml`.
+- `httpx` (Weaviate REST + GraphQL, like dedup — no `weaviate-client`), `pyyaml`.
 - External `vectorizer` service (bge-m3) and Ollama sidecar.
 - No Neo4j (that is pipeline 2 only).
