@@ -1,0 +1,32 @@
+# config/ontologies/financial_flows.yaml
+# Transparency / financial-flows ontology. The relation-pipeline orchestrator owns this catalogue,
+# validates it, and projects two artefacts: the inline ExtractionSchema handed to `ner`, and the
+# Weaviate collection specs (one column per declared attribute). The nlp modules stay agnostic.
+version: "1"
+use_case: financial_flows
+
+entity_types:
+  - name: PERSON
+    description: A natural person referenced by name, title, or role.
+    subtypes:
+      - {name: POLITICIAN, description: Elected or appointed public official.}
+      - {name: EXECUTIVE,  description: Senior corporate officer.}
+    attributes:
+      nationality: {type: string, description: "ISO 3166-1 alpha-2 if known."}
+      role_title:  {type: string, description: "Most specific stated role."}
+
+  - name: ORGANIZATION
+    description: Company, fund, foundation, or government body.
+    subtypes:
+      - {name: SHELL_COMPANY, description: No active operations.}
+    attributes:
+      jurisdiction: {type: string, description: "Country of incorporation."}
+
+relation_types:
+  - name: PAYMENT_TO
+    description: One party transfers money or assets to another.
+    head_types: [PERSON, ORGANIZATION]
+    tail_types: [PERSON, ORGANIZATION]
+    attributes:
+      amount:   {type: number, description: "Numeric amount, no symbol."}
+      currency: {type: string, description: "ISO 4217 code."}
