@@ -52,6 +52,7 @@ def _prepare_fields(profile: profiles.Profile, fields: dict) -> dict:
         prepared["descriptions_text"] = "\n".join(f"- {d}" for d in prepared["descriptions"])
     subtype = prepared.get("subtype")
     prepared["subtype_line"] = f"Subtipo: {subtype}" if subtype else ""
+    prepared.setdefault("attributes_text", "- (sin campos)")
     if profile.extract_field and profile.extract_field in prepared:
         prepared[profile.extract_field] = _reduce(str(prepared[profile.extract_field]))
     return prepared

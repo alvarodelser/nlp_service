@@ -53,6 +53,22 @@ PROFILES: dict[str, Profile] = {
         output_keys=("description",),
         extract_field="evidence_text",
     ),
+    # Domain profiles: the fields (attributes_text) go in alongside the evidence, and the rules
+    # forbid paraphrasing figures, which is where a generic description does harm.
+    "requirement_desc": Profile(
+        name="requirement_desc",
+        prompt_file="requirement_desc.es.txt",
+        schema=_DESCRIPTION_SCHEMA,
+        output_keys=("description",),
+        extract_field="evidence_text",
+    ),
+    "criterion_desc": Profile(
+        name="criterion_desc",
+        prompt_file="criterion_desc.es.txt",
+        schema=_DESCRIPTION_SCHEMA,
+        output_keys=("description",),
+        extract_field="evidence_text",
+    ),
     "aggregate": Profile(
         name="aggregate",
         prompt_file="aggregate.es.txt",

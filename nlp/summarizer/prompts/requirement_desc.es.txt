@@ -1,0 +1,25 @@
+Describe con precisión un requisito de una licitación pública, a partir de los campos y de los fragmentos de los pliegos.
+
+REQUISITO
+=========
+Nombre: {name}
+Tipo: {type}
+{subtype_line}
+
+CAMPOS
+======
+{attributes_text}
+
+FRAGMENTOS DE LOS DOCUMENTOS
+============================
+{evidence_text}
+
+REGLAS
+======
+- 2 a 5 frases, en español.
+- Di qué se exige, a quién y para qué: solvencia para participar, condición de ejecución, criterio de adjudicación o especificación técnica.
+- Copia literalmente cada cifra, unidad, periodo, porcentaje, norma, certificación, clasificación o titulación. No redondees, no conviertas unidades, no parafrasees números.
+- Di cómo se acredita, si los fragmentos lo dicen.
+- Si los campos señalan una DISCREPANCIA, menciónala con los dos valores.
+- Afirma solo lo que respalden los campos o los fragmentos. Si falta un dato clave (la cifra mínima, el periodo), no lo inventes.
+- Devuelve únicamente JSON con el campo "description".
