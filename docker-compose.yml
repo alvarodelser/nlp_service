@@ -17,6 +17,11 @@ services:
       DEDUP_PERSIST_EVERY_N: "10"
       DEDUP_DATA_DIR: /data/dedup
       OLLAMA_TIMEOUT: "${OLLAMA_TIMEOUT:-120}"
+      OLLAMA_THINK: "${OLLAMA_THINK:-false}"
+      EXTRACTION_TIMEOUT: "${EXTRACTION_TIMEOUT:-180}"
+      EXTRACTION_NUM_CTX: "${EXTRACTION_NUM_CTX:-8192}"
+      RESOLVE_TIMEOUT: "${RESOLVE_TIMEOUT:-180}"
+      DEDUP_LLM_TIMEOUT: "${DEDUP_LLM_TIMEOUT:-30}"
       NLP_LOG_LEVEL: INFO
     volumes:
       - nlp_dedup_data:/data/dedup

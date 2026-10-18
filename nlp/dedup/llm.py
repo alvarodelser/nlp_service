@@ -12,6 +12,7 @@ log = logging.getLogger(__name__)
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://ollama:11434")
 ADJ_MODEL   = os.environ.get("EXTRACTION_MODEL", "qwen2.5:32b")
 ADJ_TIMEOUT = float(os.environ.get("DEDUP_LLM_TIMEOUT", "30"))
+OLLAMA_THINK = os.environ.get("OLLAMA_THINK", "false").lower() == "true"
 
 _SCHEMA = {
     "type": "object",
@@ -34,7 +35,7 @@ def adjudicate(kind: str, text_a: str, text_b: str) -> str:
             f"{OLLAMA_HOST}/api/chat",
             json={"model": ADJ_MODEL,
                   "messages": [{"role": "user", "content": prompt}],
-                  "stream": False, "format": _SCHEMA, "options": {"temperature": 0}},
+                  "stream": False, "think": OLLAMA_THINK, "format": _SCHEMA, "options": {"temperature": 0}},
             timeout=ADJ_TIMEOUT,
         )
         r.raise_for_status()

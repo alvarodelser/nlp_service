@@ -8,6 +8,7 @@ import httpx
 OLLAMA_HOST     = os.environ.get("OLLAMA_HOST", "http://ollama:11434")
 RESOLVE_MODEL   = os.environ.get("RESOLVE_MODEL", "qwen2.5:32b")
 RESOLVE_TIMEOUT = float(os.environ.get("RESOLVE_TIMEOUT", "180"))
+OLLAMA_THINK    = os.environ.get("OLLAMA_THINK", "false").lower() == "true"
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "resolution.txt"
 _TEMPLATE: str | None = None
@@ -54,6 +55,7 @@ def refine(candidates) -> list[dict]:
             "model": RESOLVE_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
+            "think": OLLAMA_THINK,
             "format": _CLUSTER_SCHEMA,
             "options": {"temperature": 0},
         },

@@ -11,6 +11,7 @@ log = logging.getLogger(__name__)
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://ollama:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:e2b")
+OLLAMA_THINK = os.environ.get("OLLAMA_THINK", "false").lower() == "true"
 
 _JSON_SCHEMA: dict = {
     "type": "object",
@@ -29,6 +30,7 @@ def _call_once(prompt: str, schema: dict, timeout: float) -> dict[str, Any]:
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
+            "think": OLLAMA_THINK,
             "format": schema,
         },
         timeout=timeout,

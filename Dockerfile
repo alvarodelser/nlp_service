@@ -9,8 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# NLTK stopwords for sumy
-RUN python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('stopwords', quiet=True)"
+# NLTK tokenizers + stopwords for sumy (nltk>=3.9 reads punkt_tab)
+RUN python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True); nltk.download('stopwords', quiet=True)"
 
 # Pre-pull NLP models so first request is fast (~2 GB total)
 # NER: Flair Spanish large (XLM-R + character LM, F1=90.54)

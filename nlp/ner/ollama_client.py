@@ -13,6 +13,7 @@ OLLAMA_HOST        = os.environ.get("OLLAMA_HOST", "http://ollama:11434")
 EXTRACTION_MODEL   = os.environ.get("EXTRACTION_MODEL", "qwen2.5:32b")
 EXTRACTION_TIMEOUT = float(os.environ.get("EXTRACTION_TIMEOUT", "180"))
 EXTRACTION_NUM_CTX = int(os.environ.get("EXTRACTION_NUM_CTX", "8192"))
+OLLAMA_THINK       = os.environ.get("OLLAMA_THINK", "false").lower() == "true"
 
 
 def extract(system: str, user: str, grammar: dict, max_retries: int = 3) -> dict[str, Any]:
@@ -30,6 +31,7 @@ def extract(system: str, user: str, grammar: dict, max_retries: int = 3) -> dict
                     "messages": [{"role": "system", "content": system},
                                  {"role": "user", "content": user}],
                     "stream": False,
+                    "think": OLLAMA_THINK,
                     "format": grammar,
                     "options": {"temperature": 0, "num_ctx": EXTRACTION_NUM_CTX},
                 },
@@ -55,6 +57,7 @@ def rewrite(system: str, user: str) -> str:
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
             "stream": False,
+            "think": OLLAMA_THINK,
             "options": {"temperature": 0, "num_ctx": EXTRACTION_NUM_CTX},
         },
         timeout=EXTRACTION_TIMEOUT,
