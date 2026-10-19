@@ -71,6 +71,7 @@ def _register_routers() -> None:
     from api.routers import resolve as resolve_router
     from api.routers import dedup as dedup_router
     from api.routers import ollama as ollama_router
+    from api.routers import coref as coref_router
     app.include_router(summarize_router.router)
     app.include_router(geotag_router.router)
     app.include_router(nli_router.router)
@@ -78,6 +79,7 @@ def _register_routers() -> None:
     app.include_router(resolve_router.router)
     app.include_router(dedup_router.router)
     app.include_router(ollama_router.router)
+    app.include_router(coref_router.router)
 
 
 _register_routers()
