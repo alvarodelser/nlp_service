@@ -1,0 +1,36 @@
+Extrae la fórmula con la que se puntúa un criterio de adjudicación de una licitación pública, a partir de los campos y de los fragmentos de los pliegos.
+
+CRITERIO
+========
+Nombre: {name}
+Puntos: {points}
+
+CAMPOS
+======
+{attributes_text}
+
+FRAGMENTOS DE LOS DOCUMENTOS
+============================
+{evidence_text}
+
+QUÉ DEVOLVER
+============
+- has_formula: true si el texto dice cómo se calcula la puntuación (una fórmula, una regla proporcional o un baremo por tramos); false si es un juicio de valor sin regla de cálculo.
+- literal: true si la fórmula aparece escrita en el texto; false si la deduces de una regla en palabras (por ejemplo «las demás ofertas se puntuarán de forma proporcional»).
+- expression: «SALIDA = expresión», con esta sintaxis y nada más:
+  números con punto decimal (0.5); símbolos de letras, cifras y _ empezando por letra (P, Pmax, Of_i, Of_min, B_i);
+  + - * / ^ y paréntesis; comparaciones < <= > >= == !=;
+  if(condición, valor_si, valor_no) para tramos y límites; min(a, b), max(a, b), abs(x), sqrt(x), ln(x), log10(x), exp(x), floor(x), ceil(x).
+  Usa los mismos nombres de símbolo que el pliego cuando los tenga (P, Pi, Of, OB, PL...). Un baremo por tramos se escribe con if anidados.
+- variables: TODOS los símbolos de la expresión, incluida la salida, cada uno con:
+  symbol (igual que en la expresión), meaning (qué es, en español, breve y preciso),
+  kind: output (la puntuación obtenida), input (lo que oferta cada licitador), parameter (un dato del expediente o de las demás ofertas, como el presupuesto base o la oferta más baja), constant (un número fijo como los puntos máximos),
+  value: su valor si el texto lo da (puntos máximos, presupuesto base...) o null, unit: «puntos», «euros», «%», «años»... o "".
+- conditions: reglas que la expresión no recoge (umbrales de saciedad, bajas anormales, redondeos, exclusiones), copiadas o resumidas del texto. Lista vacía si no hay.
+- source_text: el fragmento literal del texto donde está la fórmula o la regla. "" si no hay.
+
+REGLAS
+======
+- Si has_formula es false: expression "", variables [], conditions [], source_text "".
+- No inventes cifras: si el texto no da un valor, value es null.
+- Devuelve únicamente JSON con los campos indicados.

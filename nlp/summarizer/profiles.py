@@ -4,12 +4,29 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from . import validator
+from . import formula, validator
 
 _ARTICLE_SCHEMA = {
     "type": "object",
     "properties": {"headline": {"type": "string"}, "summary": {"type": "string"}},
     "required": ["headline", "summary"],
+}
+_FORMULA_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "has_formula": {"type": "boolean"},
+        "literal":     {"type": "boolean"},          # copied from the text (true) or deduced from words (false)
+        "expression":  {"type": "string"},
+        "variables":   {"type": "array", "items": {
+            "type": "object",
+            "properties": {"symbol": {"type": "string"}, "meaning": {"type": "string"},
+                           "kind": {"type": "string", "enum": ["output", "input", "parameter", "constant"]},
+                           "value": {"type": ["number", "null"]}, "unit": {"type": "string"}},
+            "required": ["symbol", "meaning", "kind", "value", "unit"]}},
+        "conditions":  {"type": "array", "items": {"type": "string"}},
+        "source_text": {"type": "string"},
+    },
+    "required": ["has_formula", "literal", "expression", "variables", "conditions", "source_text"],
 }
 _DESCRIPTION_SCHEMA = {
     "type": "object",
@@ -68,6 +85,17 @@ PROFILES: dict[str, Profile] = {
         schema=_DESCRIPTION_SCHEMA,
         output_keys=("description",),
         extract_field="evidence_text",
+    ),
+    # A scoring formula as a parseable expression with every symbol explained. No extractive
+    # reduction: the formula is often one line that TextRank would drop; the caller caps the text.
+    "criterion_formula": Profile(
+        name="criterion_formula",
+        prompt_file="criterion_formula.es.txt",
+        schema=_FORMULA_SCHEMA,
+        output_keys=("has_formula", "literal", "expression", "variables", "conditions", "source_text"),
+        extract_field=None,
+        validate=formula.check,
+        retry_suffix="\nRECUERDA: «SALIDA = expresión» con la sintaxis indicada y cada símbolo declarado en variables.",
     ),
     "aggregate": Profile(
         name="aggregate",
