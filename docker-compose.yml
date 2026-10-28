@@ -5,7 +5,8 @@ services:
     build: .
     container_name: nlp-service
     ports:
-      - "${NLP_PORT:-4200}:8000"
+      # Loopback only: the public entrypoint is the key-checking proxy, not this port.
+      - "127.0.0.1:${NLP_PORT:-4200}:8000"
     environment:
       OLLAMA_HOST: ${OLLAMA_HOST}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
