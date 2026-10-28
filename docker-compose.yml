@@ -4,6 +4,7 @@ services:
   nlp-service:
     build: .
     container_name: nlp-service
+    restart: unless-stopped
     ports:
       # Loopback only: the public entrypoint is the key-checking proxy, not this port.
       - "127.0.0.1:${NLP_PORT:-4200}:8000"
